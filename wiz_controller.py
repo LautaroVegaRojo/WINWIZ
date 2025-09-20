@@ -1,4 +1,4 @@
-from pywizlight import wizlight
+from pywizlight import wizlight, PilotBuilder
 from config_manager import load_config
 import asyncio
 import logging
@@ -35,7 +35,7 @@ async def set_light_color(ip, rgb):
         return
     try:
         light = wizlight(ip)
-        await light.turn_on(pywizlight.PilotBuilder(rgb=rgb))
+        await light.turn_on(PilotBuilder(rgb=rgb))
         logging.info(f"Color de luz en IP {ip} cambiado a RGB {rgb}")
     except Exception as e:
         logging.error(f"Error al cambiar color de la luz {ip}: {e}")
@@ -56,7 +56,7 @@ async def set_light_brightness(ip, brightness):
         brightness = max(10, min(100, int(brightness)))
         
         light = wizlight(ip)
-        await light.turn_on(pywizlight.PilotBuilder(brightness=brightness))
+        await light.turn_on(PilotBuilder(brightness=brightness))
         logging.info(f"Brillo de luz en IP {ip} cambiado a {brightness}%")
     except Exception as e:
         logging.error(f"Error al cambiar brillo de la luz {ip}: {e}")
