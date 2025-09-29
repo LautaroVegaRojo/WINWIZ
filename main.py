@@ -138,7 +138,6 @@ class WizManager:
 # ----------------------------------------------------------------------
 # --- WIDGETS DE LA INTERFAZ ---
 # ----------------------------------------------------------------------
-
 class LampControl(QWidget):
     """Widget individual para controlar una lámpara (ON/OFF, brillo, color, temperatura)."""
     def __init__(self, lamp_data, wiz_manager, parent=None):
@@ -147,15 +146,68 @@ class LampControl(QWidget):
         self.ip = lamp_data['ip']
         self.wiz_manager = wiz_manager
         
-        # Estado inicial (asumimos ON si el brillo no es 0)
         initial_brightness = lamp_data.get('last_brightness', 100)
         self.is_on = (initial_brightness > 0)
         self.current_color = QColor(lamp_data.get('last_color_hex', '#ffffff')) 
-        self.current_temp = lamp_data.get('last_temp_kelvin', 2700) # Temperatura por defecto
+        self.current_temp = lamp_data.get('last_temp_kelvin', 2700) 
 
         main_layout = QVBoxLayout(self)
-        main_layout.setContentsMargins(5, 5, 5, 5)
+        main_layout.setContentsMargins(10, 5, 10, 5) # Márgenes más generosos
+        main_layout.setSpacing(5) # Espaciado entre elementos
         
+        # Estilo para el contenedor de la lámpara (simula las tarjetas del diseño)
+        self.setStyleSheet("""
+            LampControl {
+                background-color: #2D2D3D; /* Color de fondo similar a las tarjetas */
+                border-radius: 8px;
+                padding: 5px;
+            }
+            QLabel {
+                color: #A0A0A0; /* Texto gris claro para las etiquetas */
+                font-size: 11px;
+            }
+            QLabel:first-child { /* Nombre de la lámpara */
+                color: #FFFFFF;
+                font-size: 13px;
+                font-weight: bold;
+            }
+            QSlider::groove:horizontal {
+                border: 1px solid #4D4D5D;
+                height: 4px;
+                background: #3A3A4A;
+                margin: 0px;
+                border-radius: 2px;
+            }
+            QSlider::handle:horizontal {
+                background: #66CCFF; /* Azul brillante para el handle */
+                border: 1px solid #66CCFF;
+                width: 14px;
+                height: 14px;
+                margin: -5px 0; /* Ajusta la posición del handle */
+                border-radius: 7px;
+            }
+            QSlider::sub-page:horizontal {
+                background: #66CCFF; /* Color de la parte "llena" del slider */
+                border-radius: 2px;
+            }
+            QCheckBox::indicator {
+                width: 16px;
+                height: 16px;
+                border-radius: 4px;
+                border: 1px solid #4D4D5D;
+                background-color: #2D2D3D;
+            }
+            QCheckBox::indicator:checked {
+                background-color: #7B68EE; /* Púrpura para activado */
+                border: 1px solid #7B68EE;
+            }
+            QCheckBox {
+                color: #FFFFFF;
+                font-size: 12px;
+                spacing: 5px;
+            }
+        """)
+
         # --- 1. Nombre y Toggle ON/OFF ---
         header_layout = QHBoxLayout()
         header_layout.addWidget(QLabel(f"<b>{lamp_data['name']}</b>", alignment=Qt.AlignmentFlag.AlignLeft))
@@ -190,9 +242,8 @@ class LampControl(QWidget):
         temp_layout.addWidget(QLabel("Temp (K):"))
         
         self.temp_slider = QSlider(Qt.Orientation.Horizontal)
-        # Mapeamos los Kelvins (2200 a 6500) a un rango de slider de 0 a 100
         self.temp_slider.setRange(0, 100) 
-        self.temp_slider.setValue(self.kelvin_to_slider(self.current_temp)) # Posición inicial
+        self.temp_slider.setValue(self.kelvin_to_slider(self.current_temp))
         self.temp_slider.setFixedWidth(100)
         self.temp_slider.valueChanged.connect(self.send_temp_command)
         
@@ -209,13 +260,14 @@ class LampControl(QWidget):
         
         self.color_button = QPushButton()
         self.color_button.setFixedSize(20, 20)
-        self.color_button.setStyleSheet(f"background-color: {self.current_color.name()}")
+        self.color_button.setStyleSheet(f"background-color: {self.current_color.name()}; border-radius: 4px;") # Bordes redondeados
         self.color_button.clicked.connect(self.show_color_dialog)
         
         color_layout.addWidget(self.color_button)
         color_layout.addStretch()
         
         main_layout.addLayout(color_layout)
+
 
     # ----------------------------------------------------------------------
     # --- MÉTODOS DE CONVERSIÓN ---
@@ -322,23 +374,30 @@ class LampControl(QWidget):
             print(f"Comando de color RGB forzado enviado a {self.ip}. R:{r}, G:{g}, B:{b}, D:{dimming}")
             
 class PopupWindow(QWidget):
-    """Ventana principal (pop-up) que contiene la lista de lámparas."""
+    """Ventana principal (pop-up) que contiene la lista de lámparas con un estilo moderno."""
     def __init__(self, wiz_manager):
         super().__init__()
         self.wiz_manager = wiz_manager
         self.setWindowTitle("Control de Lámparas")
         self.setWindowFlags(Qt.WindowType.Tool | Qt.WindowType.FramelessWindowHint | Qt.WindowType.WindowStaysOnTopHint)
-        self.setGeometry(0, 0, 350, 400) # Tamaño aumentado
+        self.setGeometry(0, 0, 350, 450) # Altura aumentada un poco
+
+        # Aplicar los estilos directamente a la ventana
+        self.apply_styles()
 
         main_layout = QVBoxLayout(self)
-        main_layout.setContentsMargins(10, 10, 10, 10)
+        main_layout.setContentsMargins(15, 15, 15, 15) # Más relleno
+        main_layout.setSpacing(10) # Más espacio entre secciones
 
         # 1. Título y botones de gestión
         header_layout = QHBoxLayout()
-        header_layout.addWidget(QLabel("<b>Control WiZ</b>", alignment=Qt.AlignmentFlag.AlignCenter))
+        title_label = QLabel("<b>Control WiZ</b>")
+        title_label.setObjectName("popupTitle") # Para poder estilizarlo específicamente
+        header_layout.addWidget(title_label, alignment=Qt.AlignmentFlag.AlignCenter)
         
         self.discover_button = QPushButton("Descubrir")
-        self.discover_button.setFixedSize(70, 25)
+        self.discover_button.setFixedSize(80, 28) # Tamaño fijo para consistencia
+        self.discover_button.setObjectName("discoverButton") # Para estilizar
         self.discover_button.clicked.connect(self.start_discovery)
         
         header_layout.addWidget(self.discover_button)
@@ -348,18 +407,22 @@ class PopupWindow(QWidget):
         self.scroll_area = QScrollArea()
         self.scroll_area.setWidgetResizable(True)
         self.scroll_area.setFrameShape(QFrame.Shape.NoFrame)
+        self.scroll_area.setObjectName("scrollArea")
         main_layout.addWidget(self.scroll_area)
         
         self.lamp_list_container = QWidget()
+        self.lamp_list_container.setObjectName("lampListContainer")
         self.lamp_list_layout = QVBoxLayout(self.lamp_list_container)
-        self.lamp_list_layout.setSpacing(10)
+        self.lamp_list_layout.setSpacing(10) # Espacio entre cada control de lámpara
         self.lamp_list_layout.addStretch() 
         self.scroll_area.setWidget(self.lamp_list_container)
 
         # 3. Botones Inferiores
         footer_layout = QHBoxLayout()
         self.hide_button = QPushButton("Ocultar")
+        self.hide_button.setObjectName("hideButton")
         self.exit_button = QPushButton("Salir")
+        self.exit_button.setObjectName("exitButton")
         footer_layout.addWidget(self.hide_button)
         footer_layout.addWidget(self.exit_button)
         main_layout.addLayout(footer_layout)
@@ -368,6 +431,67 @@ class PopupWindow(QWidget):
         
         self.load_lamp_widgets()
 
+    def apply_styles(self):
+        """Aplica la hoja de estilos QSS a la ventana."""
+        self.setStyleSheet("""
+            QWidget#PopupWindow { /* Asegúrate de que el ID de objeto sea correcto */
+                background-color: #20202F; /* Fondo principal oscuro */
+                border-radius: 12px; /* Bordes redondeados para la ventana */
+                border: 1px solid #3A3A4A; /* Un pequeño borde sutil */
+            }
+
+            QLabel#popupTitle {
+                color: #FFFFFF;
+                font-size: 16px;
+                font-weight: bold;
+                padding-bottom: 5px;
+            }
+
+            QPushButton {
+                background-color: #4D4D5D; /* Botón gris oscuro */
+                color: #FFFFFF;
+                border-radius: 8px;
+                padding: 5px 10px;
+                font-size: 12px;
+                border: none;
+            }
+            QPushButton:hover {
+                background-color: #5A5A6A;
+            }
+            QPushButton:pressed {
+                background-color: #3A3A4A;
+            }
+            QPushButton#discoverButton {
+                background-color: #7B68EE; /* Púrpura para el botón Discover */
+            }
+            QPushButton#discoverButton:hover {
+                background-color: #8C7DE1;
+            }
+            QPushButton#discoverButton:pressed {
+                background-color: #6B57D2;
+            }
+
+            QScrollArea {
+                background-color: transparent; /* Fondo transparente para el área de scroll */
+                border: none;
+            }
+            
+            QWidget#lampListContainer {
+                background-color: transparent; /* El contenedor interno también transparente */
+            }
+
+            QMessageBox {
+                background-color: #2D2D3D;
+                color: #FFFFFF;
+            }
+            QMessageBox QLabel {
+                color: #FFFFFF;
+            }
+            QMessageBox QPushButton {
+                background-color: #7B68EE;
+                color: #FFFFFF;
+            }
+        """)
     def load_lamp_widgets(self):
         """Carga los widgets de las lámparas guardadas."""
         # Limpiar widgets antiguos
