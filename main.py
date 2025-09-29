@@ -197,7 +197,7 @@ class LampControl(QWidget):
         self.wiz_manager.send_command(self.ip, command)
 
     def show_color_dialog(self):
-        """Abre el diálogo para seleccionar el color y envía el comando."""
+        """Abre el diálogo para seleccionar el color y envía el comando RGB."""
         color = QColorDialog.getColor(self.current_color, self, "Seleccionar Color")
         
         if color.isValid():
@@ -205,26 +205,29 @@ class LampControl(QWidget):
             self.color_button.setStyleSheet(f"background-color: {self.current_color.name()}")
             self.wiz_manager.update_lamp_state(self.mac, color_hex=color.name())
             
-            # Convertir QColor a HSL para el comando WiZ
-            # El comando setPilot requiere h (hue), s (saturation), y dimming (brightness)
-            # WiZ usa hue [0, 359], sat [0, 100], dimming [10, 100]
-            hue = color.hsvHue() # QColor returns 0-359
-            sat = color.hsvSaturation() / 255 * 100 # QColor returns 0-255, convert to 0-100
+            # Obtener los valores RGB (Rango 0-255)
+            r = color.red()
+            g = color.green()
+            b = color.blue()
             
-            # Usamos el brillo actual del slider
+            # Obtener el brillo actual del slider (Rango 10-100)
             dimming = self.brightness_slider.value()
 
+            # 🟢 CORRECCIÓN CLAVE: Envío del comando RGB + Forzado de Modo
             command = {
                 "method": "setPilot",
                 "params": {
-                    "h": int(hue),
-                    "s": int(sat),
-                    "dimming": dimming
+                    "r": int(r),
+                    "g": int(g),
+                    "b": int(b),
+                    "dimming": int(dimming),
+                    "state": True,
+                    # Esto fuerza la lámpara a usar el modo de color puro (RGB).
+                    "colorMode": "rgb" 
                 }
             }
             self.wiz_manager.send_command(self.ip, command)
-            print(f"Comando de color enviado a {self.ip}")
-
+            print(f"Comando de color RGB forzado enviado a {self.ip}. R:{r}, G:{g}, B:{b}, D:{dimming}")
 
 class PopupWindow(QWidget):
     """Ventana principal (pop-up) que contiene la lista de lámparas."""

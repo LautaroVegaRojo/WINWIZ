@@ -4,27 +4,27 @@
         "name": "WiZ-57fb36",
         "mac": "d8a01157fb36",
         "last_brightness": 100,
-        "last_color_hex": "#ffff00"
+        "last_color_hex": "#ff0000"
     },
     "d8a01157f514": {
         "ip": "192.168.68.64",
         "name": "WiZ-57f514",
         "mac": "d8a01157f514",
         "last_brightness": 100,
-        "last_color_hex": "#ffffff"
+        "last_color_hex": "#55aa00"
     },
     "d8a01157fbe4": {
         "ip": "192.168.68.58",
         "name": "WiZ-57fbe4",
         "mac": "d8a01157fbe4",
         "last_brightness": 100,
-        "last_color_hex": "#ffffff"
+        "last_color_hex": "#aa0000"
     },
     "d8a01157eba2": {
         "ip": "192.168.68.65",
         "name": "WiZ-57eba2",
         "mac": "d8a01157eba2",
         "last_brightness": 100,
-        "last_color_hex": "#ff0000"
+        "last_color_hex": "#ff5500"
     }
 }
