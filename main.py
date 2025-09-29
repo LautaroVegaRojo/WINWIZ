@@ -4,10 +4,15 @@ import socket
 import os
 from PyQt6.QtWidgets import (
     QApplication, QWidget, QSystemTrayIcon, QMenu, QStyle, QLabel, QVBoxLayout, QPushButton,
-    QHBoxLayout, QSlider, QScrollArea, QFrame, QColorDialog, QLineEdit, QMessageBox
+    QHBoxLayout, QSlider, QScrollArea, QFrame, QColorDialog, QCheckBox, QMessageBox # 👈 ¡AGREGADO AQUÍ!
 )
 from PyQt6.QtGui import QIcon, QAction, QCursor, QColor
 from PyQt6.QtCore import QPoint, Qt, QThread, pyqtSignal
+
+
+# Rangos de Temperatura de Color comunes para WiZ (Kelvin)
+TEMP_MIN = 2200
+TEMP_MAX = 6500
 
 # ----------------------------------------------------------------------
 # --- CLASES DE LÓGICA DE NEGOCIO Y RED ---
@@ -85,35 +90,34 @@ class WizManager:
             
     def add_lamp(self, mac, ip, name):
         """Añade una lámpara descubierta a la lista si no existe."""
-        
-        # 🟢 CORRECCIÓN: Usar la MAC como clave principal, asegurando que todos 
-        # los campos básicos estén presentes, incluso si solo tenemos MAC e IP.
-        
         if mac not in self.lamps:
-            # Si la lámpara es nueva, creamos un registro completo:
             self.lamps[mac] = {
-                'ip': ip if ip else "0.0.0.0", # Usar IP proporcionada o por defecto
-                'name': name if name else f"WiZ-{mac[-6:]}", # Usar nombre proporcionado o MAC
-                'mac': mac, # Aseguramos que la MAC esté en los datos internos
+                'ip': ip if ip else "0.0.0.0",
+                'name': name if name else f"WiZ-{mac[-6:]}",
+                'mac': mac,
                 'last_brightness': 100,
-                'last_color_hex': '#ffffff'
+                'last_color_hex': '#ffffff',
+                'last_temp_kelvin': 2700 # 👈 Nuevo campo por defecto
             }
             self.save_lamps()
             return True
         return False
         
-    def get_lamps(self):
-        """Devuelve la lista actual de lámparas."""
-        return list(self.lamps.values())
-
-    def update_lamp_state(self, mac, brightness=None, color_hex=None):
+    def update_lamp_state(self, mac, brightness=None, color_hex=None, last_temp_kelvin=None):
         """Actualiza el estado de una lámpara en la memoria y en el archivo."""
         if mac in self.lamps:
             if brightness is not None:
                 self.lamps[mac]['last_brightness'] = brightness
             if color_hex is not None:
                 self.lamps[mac]['last_color_hex'] = color_hex
+            if last_temp_kelvin is not None:
+                self.lamps[mac]['last_temp_kelvin'] = last_temp_kelvin # 👈 Nuevo campo
             self.save_lamps()
+        
+    def get_lamps(self):
+        """Devuelve la lista actual de lámparas."""
+        return list(self.lamps.values())
+
 
     def send_command(self, ip, command_params):
         """Envía un comando UDP a la lámpara WiZ."""
@@ -136,40 +140,72 @@ class WizManager:
 # ----------------------------------------------------------------------
 
 class LampControl(QWidget):
-    """Widget individual para controlar una lámpara."""
+    """Widget individual para controlar una lámpara (ON/OFF, brillo, color, temperatura)."""
     def __init__(self, lamp_data, wiz_manager, parent=None):
         super().__init__(parent)
         self.mac = lamp_data['mac']
         self.ip = lamp_data['ip']
         self.wiz_manager = wiz_manager
         
-        self.current_color = QColor(lamp_data['last_color_hex']) 
-        
+        # Estado inicial (asumimos ON si el brillo no es 0)
+        initial_brightness = lamp_data.get('last_brightness', 100)
+        self.is_on = (initial_brightness > 0)
+        self.current_color = QColor(lamp_data.get('last_color_hex', '#ffffff')) 
+        self.current_temp = lamp_data.get('last_temp_kelvin', 2700) # Temperatura por defecto
+
         main_layout = QVBoxLayout(self)
         main_layout.setContentsMargins(5, 5, 5, 5)
         
-        # --- Nombre y Brillo ---
-        name_brightness_layout = QHBoxLayout()
-        name_brightness_layout.addWidget(QLabel(f"<b>{lamp_data['name']}</b> ({self.ip})", alignment=Qt.AlignmentFlag.AlignLeft))
+        # --- 1. Nombre y Toggle ON/OFF ---
+        header_layout = QHBoxLayout()
+        header_layout.addWidget(QLabel(f"<b>{lamp_data['name']}</b>", alignment=Qt.AlignmentFlag.AlignLeft))
+        header_layout.addStretch()
         
-        # Slider de Brillo
+        self.on_off_checkbox = QCheckBox("ON")
+        self.on_off_checkbox.setChecked(self.is_on)
+        self.on_off_checkbox.stateChanged.connect(self.send_toggle_command)
+        header_layout.addWidget(self.on_off_checkbox)
+        
+        main_layout.addLayout(header_layout)
+        
+        # --- 2. Brillo ---
+        brightness_layout = QHBoxLayout()
+        brightness_layout.addWidget(QLabel("Brillo:"))
+        
         self.brightness_slider = QSlider(Qt.Orientation.Horizontal)
-        self.brightness_slider.setRange(10, 100) # Brillo WiZ va de 10 a 100
-        self.brightness_slider.setValue(lamp_data['last_brightness'])
+        self.brightness_slider.setRange(10, 100) 
+        self.brightness_slider.setValue(initial_brightness)
         self.brightness_slider.setFixedWidth(100)
         self.brightness_slider.valueChanged.connect(self.send_brightness_command)
         
-        self.brightness_label = QLabel(f"{lamp_data['last_brightness']}%")
+        self.brightness_label = QLabel(f"{initial_brightness}%")
         
-        name_brightness_layout.addStretch()
-        name_brightness_layout.addWidget(self.brightness_slider)
-        name_brightness_layout.addWidget(self.brightness_label)
+        brightness_layout.addWidget(self.brightness_slider)
+        brightness_layout.addWidget(self.brightness_label)
         
-        main_layout.addLayout(name_brightness_layout)
+        main_layout.addLayout(brightness_layout)
         
-        # --- Control de Color ---
+        # --- 3. Temperatura de Color (Nuevo) ---
+        temp_layout = QHBoxLayout()
+        temp_layout.addWidget(QLabel("Temp (K):"))
+        
+        self.temp_slider = QSlider(Qt.Orientation.Horizontal)
+        # Mapeamos los Kelvins (2200 a 6500) a un rango de slider de 0 a 100
+        self.temp_slider.setRange(0, 100) 
+        self.temp_slider.setValue(self.kelvin_to_slider(self.current_temp)) # Posición inicial
+        self.temp_slider.setFixedWidth(100)
+        self.temp_slider.valueChanged.connect(self.send_temp_command)
+        
+        self.temp_label = QLabel(f"{self.current_temp}K")
+        
+        temp_layout.addWidget(self.temp_slider)
+        temp_layout.addWidget(self.temp_label)
+        
+        main_layout.addLayout(temp_layout)
+        
+        # --- 4. Color (Botón) ---
         color_layout = QHBoxLayout()
-        color_layout.addWidget(QLabel("Color (HSL):"))
+        color_layout.addWidget(QLabel("Color RGB:"))
         
         self.color_button = QPushButton()
         self.color_button.setFixedSize(20, 20)
@@ -182,19 +218,74 @@ class LampControl(QWidget):
         main_layout.addLayout(color_layout)
 
     # ----------------------------------------------------------------------
-    # --- MÉTODOS DE COMANDO WIZ ---
+    # --- MÉTODOS DE CONVERSIÓN ---
+    # ----------------------------------------------------------------------
+    
+    def kelvin_to_slider(self, kelvin):
+        """Convierte Kelvin (2200-6500) a un valor de slider (0-100)."""
+        return int(((kelvin - TEMP_MIN) / (TEMP_MAX - TEMP_MIN)) * 100)
+
+    def slider_to_kelvin(self, slider_val):
+        """Convierte valor de slider (0-100) a Kelvin (2200-6500)."""
+        return int(((slider_val / 100) * (TEMP_MAX - TEMP_MIN)) + TEMP_MIN)
+
+    # ----------------------------------------------------------------------
+    # --- MÉTODOS DE COMANDO WIZ (ACTUALIZADOS) ---
     # ----------------------------------------------------------------------
 
-    def send_brightness_command(self, value):
-        """Envía el comando UDP de brillo."""
-        self.brightness_label.setText(f"{value}%")
-        self.wiz_manager.update_lamp_state(self.mac, brightness=value)
+    def send_toggle_command(self, state):
+        """Envía el comando UDP de encendido/apagado."""
+        is_on = state == Qt.CheckState.Checked.value
+        self.is_on = is_on
+        
+        # Si se enciende, usamos el último brillo, si no, lo apagamos
+        dimming = self.brightness_slider.value() if is_on else 100
         
         command = {
             "method": "setPilot",
-            "params": {"dimming": value}
+            "params": {"state": is_on, "dimming": dimming}
         }
         self.wiz_manager.send_command(self.ip, command)
+
+    def send_brightness_command(self, value):
+        """Envía el comando UDP de brillo y activa la lámpara si estaba apagada."""
+        self.brightness_label.setText(f"{value}%")
+        self.wiz_manager.update_lamp_state(self.mac, brightness=value)
+        
+        # Asegura que la lámpara se encienda al mover el brillo
+        if not self.is_on:
+            self.on_off_checkbox.setChecked(True)
+            self.is_on = True
+        
+        command = {
+            "method": "setPilot",
+            "params": {"dimming": value, "state": True}
+        }
+        self.wiz_manager.send_command(self.ip, command)
+        
+    def send_temp_command(self, slider_val):
+        """Envía el comando UDP de temperatura de color (Kelvin)."""
+        kelvin = self.slider_to_kelvin(slider_val)
+        self.current_temp = kelvin
+        self.temp_label.setText(f"{kelvin}K")
+        self.wiz_manager.update_lamp_state(self.mac, last_temp_kelvin=kelvin)
+
+        # Asegura que la lámpara se encienda al cambiar la temperatura
+        if not self.is_on:
+            self.on_off_checkbox.setChecked(True)
+            self.is_on = True
+
+        command = {
+            "method": "setPilot",
+            "params": {
+                "temp": int(kelvin), 
+                "dimming": self.brightness_slider.value(),
+                "state": True,
+                "colorMode": "temp" # Forzar el modo temperatura
+            }
+        }
+        self.wiz_manager.send_command(self.ip, command)
+        print(f"Comando de temperatura enviado a {self.ip}: {kelvin}K")
 
     def show_color_dialog(self):
         """Abre el diálogo para seleccionar el color y envía el comando RGB."""
@@ -205,15 +296,17 @@ class LampControl(QWidget):
             self.color_button.setStyleSheet(f"background-color: {self.current_color.name()}")
             self.wiz_manager.update_lamp_state(self.mac, color_hex=color.name())
             
+            # Asegura que la lámpara se encienda al cambiar el color
+            if not self.is_on:
+                self.on_off_checkbox.setChecked(True)
+                self.is_on = True
+
             # Obtener los valores RGB (Rango 0-255)
             r = color.red()
             g = color.green()
             b = color.blue()
-            
-            # Obtener el brillo actual del slider (Rango 10-100)
             dimming = self.brightness_slider.value()
 
-            # 🟢 CORRECCIÓN CLAVE: Envío del comando RGB + Forzado de Modo
             command = {
                 "method": "setPilot",
                 "params": {
@@ -222,13 +315,12 @@ class LampControl(QWidget):
                     "b": int(b),
                     "dimming": int(dimming),
                     "state": True,
-                    # Esto fuerza la lámpara a usar el modo de color puro (RGB).
                     "colorMode": "rgb" 
                 }
             }
             self.wiz_manager.send_command(self.ip, command)
             print(f"Comando de color RGB forzado enviado a {self.ip}. R:{r}, G:{g}, B:{b}, D:{dimming}")
-
+            
 class PopupWindow(QWidget):
     """Ventana principal (pop-up) que contiene la lista de lámparas."""
     def __init__(self, wiz_manager):
