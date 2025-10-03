@@ -4,92 +4,76 @@ import socket
 import os
 from PyQt6.QtWidgets import (
     QApplication, QWidget, QSystemTrayIcon, QMenu, QStyle, QLabel, QVBoxLayout, QPushButton,
-    QHBoxLayout, QSlider, QScrollArea, QFrame, QColorDialog, QCheckBox, QMessageBox # 👈 ¡AGREGADO AQUÍ!
+    QHBoxLayout, QSlider, QScrollArea, QFrame, QColorDialog, QCheckBox, QMessageBox, 
+    QGraphicsDropShadowEffect, QLineEdit, QDialog, QListWidget, QListWidgetItem
 )
-from PyQt6.QtGui import QIcon, QAction, QCursor, QColor
-from PyQt6.QtCore import QPoint, Qt, QThread, pyqtSignal
+from PyQt6.QtGui import QAction, QCursor, QColor, QFont, QPainter, QPen, QPainterPath, QIcon
+from PyQt6.QtCore import (
+    QPoint, Qt, QThread, pyqtSignal, QPropertyAnimation, QTimer, QRect, QEasingCurve, QRectF
+)
 
-
-# Rangos de Temperatura de Color comunes para WiZ (Kelvin)
 TEMP_MIN = 2200
 TEMP_MAX = 6500
 
-# ----------------------------------------------------------------------
-# --- CLASES DE LÓGICA DE NEGOCIO Y RED ---
-# ----------------------------------------------------------------------
-
-# Clase para el descubrimiento de lámparas WiZ en un hilo separado
 class DiscoveryThread(QThread):
-    """Hilo para realizar el descubrimiento UDP sin bloquear la interfaz."""
-    lamp_found = pyqtSignal(dict) # Señal que emite los datos de la lámpara encontrada
+    lamp_found = pyqtSignal(dict)
 
     def run(self):
-        # El puerto 38899 es el puerto de respuesta de los dispositivos WiZ.
-        UDP_PORT = 38899 
+        UDP_PORT = 38899
         BROADCAST_IP = '255.255.255.255'
-        
-        # Comando de WiZ para obtener la información del dispositivo
-        # {"method":"getSystemConfig","params":{}} es el comando de consulta.
         DISCOVERY_MESSAGE = '{"method":"getSystemConfig","params":{}}'.encode('utf-8')
-        
+
         sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
         sock.setsockopt(socket.SOL_SOCKET, socket.SO_BROADCAST, 1)
-        sock.settimeout(1) # Esperar 1 segundo por respuesta
+        sock.settimeout(3)  # Timeout de 3 segundos como el original
 
-        # Enviar el mensaje de descubrimiento (broadcast)
-        sock.sendto(DISCOVERY_MESSAGE, (BROADCAST_IP, UDP_PORT))
+        discovered_macs = set()  # Para evitar duplicados
 
-        while True:
-            try:
-                # Recibir respuesta
-                data, addr = sock.recvfrom(1024)
-                response = json.loads(data.decode('utf-8'))
-                
-                # Extraer la MAC y la IP
-                mac = response.get('result', {}).get('mac')
-                ip = addr[0]
-                
-                if mac and ip:
-                    self.lamp_found.emit({
-                        'ip': ip,
-                        'mac': mac,
-                        'name': f"WiZ-{mac[-6:]}" # Nombre por defecto
-                    })
-                
-            except socket.timeout:
-                # Si se acaba el tiempo de espera, terminamos el descubrimiento
-                break
-            except Exception:
-                # Ignorar errores de decodificación o JSON
-                continue
-        
-        sock.close()
+        try:
+            sock.sendto(DISCOVERY_MESSAGE, (BROADCAST_IP, UDP_PORT))
+            
+            # Seguir escuchando hasta timeout (como el código original)
+            while True:
+                try:
+                    data, addr = sock.recvfrom(1024)
+                    response = json.loads(data.decode('utf-8'))
+                    mac = response.get('result', {}).get('mac')
+                    ip = addr[0]
+                    
+                    if mac and ip and mac not in discovered_macs:
+                        discovered_macs.add(mac)
+                        self.lamp_found.emit({'ip': ip, 'mac': mac, 'name': f"WiZ-{mac[-6:]}"})
+                except socket.timeout:
+                    break  # Sale del bucle cuando no hay más respuestas
+                except Exception:
+                    continue
+        finally:
+            sock.close()
 
 class WizManager:
-    """Gestiona la lista de lámparas y la persistencia de datos."""
-    
     DATA_FILE = 'lamps_data.json'
-    
-    def __init__(self):
-        self.lamps = {}  # {mac: {'ip': '...', 'name': '...', 'last_brightness': 100, ...}}
-        self.load_lamps()
 
-    def load_lamps(self):
-        """Carga los datos de las lámparas desde el archivo JSON."""
+    def __init__(self):
+        self.lamps = {}
+        self.groups = {}
+        self.load_data()
+
+    def load_data(self):
         if os.path.exists(self.DATA_FILE):
             with open(self.DATA_FILE, 'r') as f:
                 try:
-                    self.lamps = json.load(f)
+                    data = json.load(f)
+                    self.lamps = data.get('lamps', {})
+                    self.groups = data.get('groups', {})
                 except json.JSONDecodeError:
                     self.lamps = {}
-        
-    def save_lamps(self):
-        """Guarda los datos de las lámparas en el archivo JSON."""
+                    self.groups = {}
+
+    def save_data(self):
         with open(self.DATA_FILE, 'w') as f:
-            json.dump(self.lamps, f, indent=4)
-            
+            json.dump({'lamps': self.lamps, 'groups': self.groups}, f, indent=4)
+
     def add_lamp(self, mac, ip, name):
-        """Añade una lámpara descubierta a la lista si no existe."""
         if mac not in self.lamps:
             self.lamps[mac] = {
                 'ip': ip if ip else "0.0.0.0",
@@ -97,49 +81,86 @@ class WizManager:
                 'mac': mac,
                 'last_brightness': 100,
                 'last_color_hex': '#ffffff',
-                'last_temp_kelvin': 2700 # 👈 Nuevo campo por defecto
+                'last_temp_kelvin': 2700
             }
-            self.save_lamps()
+            self.save_data()
             return True
         return False
-        
+
+    def add_group(self, group_name, lamp_macs):
+        self.groups[group_name] = lamp_macs
+        self.save_data()
+
+    def get_groups(self):
+        return self.groups
+
+    def get_lamps_in_group(self, group_name):
+        lamp_macs = self.groups.get(group_name, [])
+        return [self.lamps[mac] for mac in lamp_macs if mac in self.lamps]
+
     def update_lamp_state(self, mac, brightness=None, color_hex=None, last_temp_kelvin=None):
-        """Actualiza el estado de una lámpara en la memoria y en el archivo."""
         if mac in self.lamps:
             if brightness is not None:
                 self.lamps[mac]['last_brightness'] = brightness
             if color_hex is not None:
                 self.lamps[mac]['last_color_hex'] = color_hex
             if last_temp_kelvin is not None:
-                self.lamps[mac]['last_temp_kelvin'] = last_temp_kelvin # 👈 Nuevo campo
-            self.save_lamps()
-        
+                self.lamps[mac]['last_temp_kelvin'] = last_temp_kelvin
+            self.save_data()
+
     def get_lamps(self):
-        """Devuelve la lista actual de lámparas."""
         return list(self.lamps.values())
 
-
     def send_command(self, ip, command_params):
-        """Envía un comando UDP a la lámpara WiZ."""
         try:
             sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-            sock.settimeout(0.1) # Breve timeout
-            
-            # Construye el comando JSON completo
+            sock.settimeout(0.05)  # Timeout más corto para mejor rendimiento
             command_json = json.dumps(command_params).encode('utf-8')
-            
-            # El puerto de control de WiZ es el 38899
             sock.sendto(command_json, (ip, 38899))
             sock.close()
-            print(f"Comando enviado a {ip}: {command_params['method']}")
-        except Exception as e:
-            print(f"Error al enviar comando a {ip}: {e}")
+        except Exception:
+            pass
 
-# ----------------------------------------------------------------------
-# --- WIDGETS DE LA INTERFAZ ---
-# ----------------------------------------------------------------------
+class ModernToggle(QWidget):
+    """Toggle clickeable en toda su área"""
+    stateChanged = pyqtSignal(int)
+    
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.setFixedSize(40, 20)
+        self._checked = False
+        self.setCursor(Qt.CursorShape.PointingHandCursor)
+        
+    def mousePressEvent(self, event):
+        if event.button() == Qt.MouseButton.LeftButton:
+            self._checked = not self._checked
+            self.update()
+            self.stateChanged.emit(Qt.CheckState.Checked.value if self._checked else Qt.CheckState.Unchecked.value)
+            event.accept()
+        
+    def isChecked(self):
+        return self._checked
+    
+    def setChecked(self, checked):
+        if self._checked != checked:
+            self._checked = checked
+            self.update()
+        
+    def paintEvent(self, event):
+        painter = QPainter(self)
+        painter.setRenderHint(QPainter.RenderHint.Antialiasing)
+        
+        bg_color = QColor("#005FB8") if self._checked else QColor("#5C5C5C")
+        circle_x = 22 if self._checked else 2
+        
+        painter.setPen(Qt.PenStyle.NoPen)
+        painter.setBrush(bg_color)
+        painter.drawRoundedRect(0, 0, 40, 20, 10, 10)
+        
+        painter.setBrush(QColor("#FFFFFF"))
+        painter.drawEllipse(circle_x, 2, 16, 16)
+
 class LampControl(QWidget):
-    """Widget individual para controlar una lámpara (ON/OFF, brillo, color, temperatura)."""
     def __init__(self, lamp_data, wiz_manager, parent=None):
         super().__init__(parent)
         self.mac = lamp_data['mac']
@@ -149,482 +170,464 @@ class LampControl(QWidget):
         initial_brightness = lamp_data.get('last_brightness', 100)
         self.is_on = (initial_brightness > 0)
         self.current_color = QColor(lamp_data.get('last_color_hex', '#ffffff')) 
-        self.current_temp = lamp_data.get('last_temp_kelvin', 2700) 
-
-        main_layout = QVBoxLayout(self)
-        main_layout.setContentsMargins(10, 5, 10, 5) # Márgenes más generosos
-        main_layout.setSpacing(5) # Espaciado entre elementos
+        self.current_temp = lamp_data.get('last_temp_kelvin', 2700)
+        self.current_hue = self.current_color.hue() if self.current_color.hue() >= 0 else 0
         
-        # Estilo para el contenedor de la lámpara (simula las tarjetas del diseño)
-        self.setStyleSheet("""
-            LampControl {
-                background-color: #2D2D3D; /* Color de fondo similar a las tarjetas */
-                border-radius: 8px;
-                padding: 5px;
-            }
-            QLabel {
-                color: #A0A0A0; /* Texto gris claro para las etiquetas */
-                font-size: 11px;
-            }
-            QLabel:first-child { /* Nombre de la lámpara */
-                color: #FFFFFF;
-                font-size: 13px;
-                font-weight: bold;
-            }
-            QSlider::groove:horizontal {
-                border: 1px solid #4D4D5D;
-                height: 4px;
-                background: #3A3A4A;
-                margin: 0px;
-                border-radius: 2px;
-            }
-            QSlider::handle:horizontal {
-                background: #66CCFF; /* Azul brillante para el handle */
-                border: 1px solid #66CCFF;
-                width: 14px;
-                height: 14px;
-                margin: -5px 0; /* Ajusta la posición del handle */
-                border-radius: 7px;
-            }
-            QSlider::sub-page:horizontal {
-                background: #66CCFF; /* Color de la parte "llena" del slider */
-                border-radius: 2px;
-            }
-            QCheckBox::indicator {
-                width: 16px;
-                height: 16px;
-                border-radius: 4px;
-                border: 1px solid #4D4D5D;
-                background-color: #2D2D3D;
-            }
-            QCheckBox::indicator:checked {
-                background-color: #7B68EE; /* Púrpura para activado */
-                border: 1px solid #7B68EE;
-            }
-            QCheckBox {
-                color: #FFFFFF;
-                font-size: 12px;
-                spacing: 5px;
-            }
-        """)
+        self.setObjectName("LampCard")
+        self.setup_ui(lamp_data, initial_brightness)
 
-        # --- 1. Nombre y Toggle ON/OFF ---
-        header_layout = QHBoxLayout()
-        header_layout.addWidget(QLabel(f"<b>{lamp_data['name']}</b>", alignment=Qt.AlignmentFlag.AlignLeft))
+    def setup_ui(self, lamp_data, initial_brightness):
+        main_layout = QVBoxLayout(self)
+        main_layout.setContentsMargins(12, 10, 12, 10)
+        main_layout.setSpacing(8)
+
+        # Header clickeable
+        header = QWidget()
+        header.setCursor(Qt.CursorShape.PointingHandCursor)
+        header_layout = QHBoxLayout(header)
+        header_layout.setContentsMargins(0, 0, 0, 0)
+        header_layout.setSpacing(8)
+        
+        name_label = QLabel(lamp_data['name'])
+        name_label.setObjectName("lampName")
+        header_layout.addWidget(name_label)
         header_layout.addStretch()
         
-        self.on_off_checkbox = QCheckBox("ON")
-        self.on_off_checkbox.setChecked(self.is_on)
-        self.on_off_checkbox.stateChanged.connect(self.send_toggle_command)
-        header_layout.addWidget(self.on_off_checkbox)
+        self.toggle = ModernToggle()
+        self.toggle.setChecked(self.is_on)
+        self.toggle.stateChanged.connect(self.send_toggle_command)
+        header_layout.addWidget(self.toggle)
         
-        main_layout.addLayout(header_layout)
+        def header_click(e):
+            if e.button() == Qt.MouseButton.LeftButton:
+                self.toggle.mousePressEvent(e)
+        header.mousePressEvent = header_click
         
-        # --- 2. Brillo ---
+        main_layout.addWidget(header)
+        
+        # Brillo compacto
         brightness_layout = QHBoxLayout()
-        brightness_layout.addWidget(QLabel("Brillo:"))
+        brightness_layout.setSpacing(8)
+        
+        bright_label = QLabel("☀")
+        bright_label.setFixedWidth(16)
+        bright_label.setStyleSheet("font-size: 12px; color: #E0E0E0;")
+        brightness_layout.addWidget(bright_label)
         
         self.brightness_slider = QSlider(Qt.Orientation.Horizontal)
-        self.brightness_slider.setRange(10, 100) 
+        self.brightness_slider.setRange(10, 100)
         self.brightness_slider.setValue(initial_brightness)
-        self.brightness_slider.setFixedWidth(100)
         self.brightness_slider.valueChanged.connect(self.send_brightness_command)
-        
-        self.brightness_label = QLabel(f"{initial_brightness}%")
-        
         brightness_layout.addWidget(self.brightness_slider)
-        brightness_layout.addWidget(self.brightness_label)
+        
+        self.brightness_value = QLabel(f"{initial_brightness}%")
+        self.brightness_value.setObjectName("valueLabel")
+        self.brightness_value.setFixedWidth(35)
+        brightness_layout.addWidget(self.brightness_value)
         
         main_layout.addLayout(brightness_layout)
         
-        # --- 3. Temperatura de Color (Nuevo) ---
+        # Temperatura compacta
         temp_layout = QHBoxLayout()
-        temp_layout.addWidget(QLabel("Temp (K):"))
+        temp_layout.setSpacing(8)
+        
+        temp_label = QLabel("◐")
+        temp_label.setFixedWidth(16)
+        temp_label.setStyleSheet("font-size: 12px; color: #E0E0E0;")
+        temp_layout.addWidget(temp_label)
         
         self.temp_slider = QSlider(Qt.Orientation.Horizontal)
-        self.temp_slider.setRange(0, 100) 
+        self.temp_slider.setRange(0, 100)
         self.temp_slider.setValue(self.kelvin_to_slider(self.current_temp))
-        self.temp_slider.setFixedWidth(100)
         self.temp_slider.valueChanged.connect(self.send_temp_command)
-        
-        self.temp_label = QLabel(f"{self.current_temp}K")
-        
         temp_layout.addWidget(self.temp_slider)
-        temp_layout.addWidget(self.temp_label)
+        
+        self.temp_value = QLabel(f"{self.current_temp}K")
+        self.temp_value.setObjectName("valueLabel")
+        self.temp_value.setFixedWidth(35)
+        temp_layout.addWidget(self.temp_value)
         
         main_layout.addLayout(temp_layout)
         
-        # --- 4. Color (Botón) ---
+        # Color como slider de HUE
         color_layout = QHBoxLayout()
-        color_layout.addWidget(QLabel("Color RGB:"))
+        color_layout.setSpacing(8)
         
-        self.color_button = QPushButton()
-        self.color_button.setFixedSize(20, 20)
-        self.color_button.setStyleSheet(f"background-color: {self.current_color.name()}; border-radius: 4px;") # Bordes redondeados
-        self.color_button.clicked.connect(self.show_color_dialog)
+        color_label = QLabel("●")
+        color_label.setFixedWidth(16)
+        color_label.setStyleSheet("font-size: 12px; color: #E0E0E0;")
+        color_layout.addWidget(color_label)
         
-        color_layout.addWidget(self.color_button)
-        color_layout.addStretch()
+        self.color_slider = QSlider(Qt.Orientation.Horizontal)
+        self.color_slider.setRange(0, 359)
+        self.color_slider.setValue(self.current_hue)
+        self.color_slider.setObjectName("colorSlider")
+        self.color_slider.valueChanged.connect(self.send_color_command)
+        color_layout.addWidget(self.color_slider)
+        
+        self.color_preview = QLabel()
+        self.color_preview.setFixedSize(35, 20)
+        self.update_color_preview()
+        color_layout.addWidget(self.color_preview)
         
         main_layout.addLayout(color_layout)
 
+    def update_color_preview(self):
+        color = QColor.fromHsv(self.current_hue, 255, 255)
+        self.color_preview.setStyleSheet(f"""
+            QLabel {{
+                background-color: {color.name()};
+                border: 1px solid rgba(255,255,255,0.2);
+                border-radius: 4px;
+            }}
+        """)
 
-    # ----------------------------------------------------------------------
-    # --- MÉTODOS DE CONVERSIÓN ---
-    # ----------------------------------------------------------------------
-    
     def kelvin_to_slider(self, kelvin):
-        """Convierte Kelvin (2200-6500) a un valor de slider (0-100)."""
         return int(((kelvin - TEMP_MIN) / (TEMP_MAX - TEMP_MIN)) * 100)
 
     def slider_to_kelvin(self, slider_val):
-        """Convierte valor de slider (0-100) a Kelvin (2200-6500)."""
         return int(((slider_val / 100) * (TEMP_MAX - TEMP_MIN)) + TEMP_MIN)
 
-    # ----------------------------------------------------------------------
-    # --- MÉTODOS DE COMANDO WIZ (ACTUALIZADOS) ---
-    # ----------------------------------------------------------------------
-
     def send_toggle_command(self, state):
-        """Envía el comando UDP de encendido/apagado."""
         is_on = state == Qt.CheckState.Checked.value
         self.is_on = is_on
-        
-        # Si se enciende, usamos el último brillo, si no, lo apagamos
         dimming = self.brightness_slider.value() if is_on else 100
-        
-        command = {
-            "method": "setPilot",
-            "params": {"state": is_on, "dimming": dimming}
-        }
+        command = {"method": "setPilot", "params": {"state": is_on, "dimming": dimming}}
         self.wiz_manager.send_command(self.ip, command)
 
     def send_brightness_command(self, value):
-        """Envía el comando UDP de brillo y activa la lámpara si estaba apagada."""
-        self.brightness_label.setText(f"{value}%")
+        self.brightness_value.setText(f"{value}%")
         self.wiz_manager.update_lamp_state(self.mac, brightness=value)
-        
-        # Asegura que la lámpara se encienda al mover el brillo
         if not self.is_on:
-            self.on_off_checkbox.setChecked(True)
-            self.is_on = True
-        
-        command = {
-            "method": "setPilot",
-            "params": {"dimming": value, "state": True}
-        }
+            self.toggle.setChecked(True)
+        command = {"method": "setPilot", "params": {"dimming": value, "state": True}}
         self.wiz_manager.send_command(self.ip, command)
         
     def send_temp_command(self, slider_val):
-        """Envía el comando UDP de temperatura de color (Kelvin)."""
         kelvin = self.slider_to_kelvin(slider_val)
         self.current_temp = kelvin
-        self.temp_label.setText(f"{kelvin}K")
+        self.temp_value.setText(f"{kelvin}K")
         self.wiz_manager.update_lamp_state(self.mac, last_temp_kelvin=kelvin)
-
-        # Asegura que la lámpara se encienda al cambiar la temperatura
         if not self.is_on:
-            self.on_off_checkbox.setChecked(True)
-            self.is_on = True
-
+            self.toggle.setChecked(True)
         command = {
             "method": "setPilot",
-            "params": {
-                "temp": int(kelvin), 
-                "dimming": self.brightness_slider.value(),
-                "state": True,
-                "colorMode": "temp" # Forzar el modo temperatura
-            }
+            "params": {"temp": int(kelvin), "dimming": self.brightness_slider.value(), "state": True, "colorMode": "temp"}
         }
         self.wiz_manager.send_command(self.ip, command)
-        print(f"Comando de temperatura enviado a {self.ip}: {kelvin}K")
 
-    def show_color_dialog(self):
-        """Abre el diálogo para seleccionar el color y envía el comando RGB."""
-        color = QColorDialog.getColor(self.current_color, self, "Seleccionar Color")
+    def send_color_command(self, hue):
+        self.current_hue = hue
+        color = QColor.fromHsv(hue, 255, 255)
+        self.current_color = color
+        self.update_color_preview()
         
-        if color.isValid():
-            self.current_color = color
-            self.color_button.setStyleSheet(f"background-color: {self.current_color.name()}")
-            self.wiz_manager.update_lamp_state(self.mac, color_hex=color.name())
-            
-            # Asegura que la lámpara se encienda al cambiar el color
-            if not self.is_on:
-                self.on_off_checkbox.setChecked(True)
-                self.is_on = True
+        self.wiz_manager.update_lamp_state(self.mac, color_hex=color.name())
+        if not self.is_on:
+            self.toggle.setChecked(True)
+        
+        r, g, b = color.red(), color.green(), color.blue()
+        dimming = self.brightness_slider.value()
+        command = {
+            "method": "setPilot",
+            "params": {"r": int(r), "g": int(g), "b": int(b), "dimming": int(dimming), "state": True, "colorMode": "rgb"}
+        }
+        self.wiz_manager.send_command(self.ip, command)
 
-            # Obtener los valores RGB (Rango 0-255)
-            r = color.red()
-            g = color.green()
-            b = color.blue()
-            dimming = self.brightness_slider.value()
+class GroupDialog(QDialog):
+    def __init__(self, wiz_manager, parent=None):
+        super().__init__(parent)
+        self.wiz_manager = wiz_manager
+        self.setWindowTitle("Crear Grupo")
+        self.setModal(True)
+        self.resize(300, 400)
+        
+        layout = QVBoxLayout(self)
+        
+        layout.addWidget(QLabel("Nombre del grupo:"))
+        self.group_name_input = QLineEdit()
+        layout.addWidget(self.group_name_input)
+        
+        layout.addWidget(QLabel("Seleccionar luces:"))
+        self.lamp_list = QListWidget()
+        for lamp in self.wiz_manager.get_lamps():
+            item = QListWidgetItem(lamp['name'])
+            item.setData(Qt.ItemDataRole.UserRole, lamp['mac'])
+            item.setCheckState(Qt.CheckState.Unchecked)
+            self.lamp_list.addItem(item)
+        layout.addWidget(self.lamp_list)
+        
+        btn_layout = QHBoxLayout()
+        save_btn = QPushButton("Guardar")
+        cancel_btn = QPushButton("Cancelar")
+        save_btn.clicked.connect(self.save_group)
+        cancel_btn.clicked.connect(self.reject)
+        btn_layout.addWidget(save_btn)
+        btn_layout.addWidget(cancel_btn)
+        layout.addLayout(btn_layout)
+    
+    def save_group(self):
+        group_name = self.group_name_input.text().strip()
+        if not group_name:
+            QMessageBox.warning(self, "Error", "Ingresa un nombre para el grupo")
+            return
+        
+        selected_macs = []
+        for i in range(self.lamp_list.count()):
+            item = self.lamp_list.item(i)
+            if item.checkState() == Qt.CheckState.Checked:
+                selected_macs.append(item.data(Qt.ItemDataRole.UserRole))
+        
+        if not selected_macs:
+            QMessageBox.warning(self, "Error", "Selecciona al menos una luz")
+            return
+        
+        self.wiz_manager.add_group(group_name, selected_macs)
+        self.accept()
 
-            command = {
-                "method": "setPilot",
-                "params": {
-                    "r": int(r),
-                    "g": int(g),
-                    "b": int(b),
-                    "dimming": int(dimming),
-                    "state": True,
-                    "colorMode": "rgb" 
-                }
-            }
-            self.wiz_manager.send_command(self.ip, command)
-            print(f"Comando de color RGB forzado enviado a {self.ip}. R:{r}, G:{g}, B:{b}, D:{dimming}")
-            
 class PopupWindow(QWidget):
-    """Ventana principal (pop-up) que contiene la lista de lámparas con un estilo moderno."""
     def __init__(self, wiz_manager):
         super().__init__()
         self.wiz_manager = wiz_manager
-        self.setWindowTitle("Control de Lámparas")
-        self.setWindowFlags(Qt.WindowType.Tool | Qt.WindowType.FramelessWindowHint | Qt.WindowType.WindowStaysOnTopHint)
-        self.setGeometry(0, 0, 350, 450) # Altura aumentada un poco
-
-        # Aplicar los estilos directamente a la ventana
-        self.apply_styles()
-
-        main_layout = QVBoxLayout(self)
-        main_layout.setContentsMargins(15, 15, 15, 15) # Más relleno
-        main_layout.setSpacing(10) # Más espacio entre secciones
-
-        # 1. Título y botones de gestión
-        header_layout = QHBoxLayout()
-        title_label = QLabel("<b>Control WiZ</b>")
-        title_label.setObjectName("popupTitle") # Para poder estilizarlo específicamente
-        header_layout.addWidget(title_label, alignment=Qt.AlignmentFlag.AlignCenter)
         
+        self.setWindowTitle("WiZ Control")
+        self.setWindowFlags(Qt.WindowType.Tool | Qt.WindowType.FramelessWindowHint | Qt.WindowType.WindowStaysOnTopHint)
+        self.setAttribute(Qt.WidgetAttribute.WA_TranslucentBackground)
+        self.setGeometry(0, 0, 340, 450)  # Más compacta
+        
+        self.hide_timer = QTimer(self)
+        self.hide_timer.setInterval(400)
+        self.hide_timer.setSingleShot(True)
+        self.hide_timer.timeout.connect(self.hide)
+        
+        self.setup_ui()
+        self.load_content()
+
+    def paintEvent(self, event):
+        painter = QPainter(self)
+        painter.setRenderHint(QPainter.RenderHint.Antialiasing)
+        
+        path = QPainterPath()
+        path.addRoundedRect(QRectF(self.rect()), 8, 8)
+        
+        painter.setClipPath(path)
+        painter.fillRect(self.rect(), QColor(32, 32, 32, 240))
+        
+        painter.setPen(QPen(QColor(255, 255, 255, 20), 1))
+        painter.drawRoundedRect(self.rect().adjusted(0, 0, -1, -1), 8, 8)
+
+    def setup_ui(self):
+        main_layout = QVBoxLayout(self)
+        main_layout.setContentsMargins(12, 12, 12, 12)
+        main_layout.setSpacing(8)
+
+        # Botones superiores
+        btn_row = QHBoxLayout()
         self.discover_button = QPushButton("Descubrir")
-        self.discover_button.setFixedSize(80, 28) # Tamaño fijo para consistencia
-        self.discover_button.setObjectName("discoverButton") # Para estilizar
+        self.discover_button.setObjectName("discoverButton")
+        self.discover_button.setFixedHeight(32)
         self.discover_button.clicked.connect(self.start_discovery)
         
-        header_layout.addWidget(self.discover_button)
-        main_layout.addLayout(header_layout)
+        group_button = QPushButton("Crear Grupo")
+        group_button.setObjectName("groupButton")
+        group_button.setFixedHeight(32)
+        group_button.clicked.connect(self.create_group)
         
-        # 2. Área Desplazable
+        btn_row.addWidget(self.discover_button)
+        btn_row.addWidget(group_button)
+        main_layout.addLayout(btn_row)
+
+        # Área de scroll CON wheelEvent filtrado
         self.scroll_area = QScrollArea()
         self.scroll_area.setWidgetResizable(True)
         self.scroll_area.setFrameShape(QFrame.Shape.NoFrame)
-        self.scroll_area.setObjectName("scrollArea")
+        self.scroll_area.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
+        self.scroll_area.setFocusPolicy(Qt.FocusPolicy.NoFocus)  # Importante para el scroll
         main_layout.addWidget(self.scroll_area)
         
-        self.lamp_list_container = QWidget()
-        self.lamp_list_container.setObjectName("lampListContainer")
-        self.lamp_list_layout = QVBoxLayout(self.lamp_list_container)
-        self.lamp_list_layout.setSpacing(10) # Espacio entre cada control de lámpara
-        self.lamp_list_layout.addStretch() 
-        self.scroll_area.setWidget(self.lamp_list_container)
+        self.content_widget = QWidget()
+        self.content_layout = QVBoxLayout(self.content_widget)
+        self.content_layout.setSpacing(6)  # Más compacto
+        self.content_layout.setContentsMargins(0, 0, 0, 0)
+        self.content_layout.addStretch()
+        self.scroll_area.setWidget(self.content_widget)
 
-        # 3. Botones Inferiores
-        footer_layout = QHBoxLayout()
-        self.hide_button = QPushButton("Ocultar")
-        self.hide_button.setObjectName("hideButton")
-        self.exit_button = QPushButton("Salir")
-        self.exit_button.setObjectName("exitButton")
-        footer_layout.addWidget(self.hide_button)
-        footer_layout.addWidget(self.exit_button)
-        main_layout.addLayout(footer_layout)
-
-        self.hide_button.clicked.connect(self.hide) 
-        
-        self.load_lamp_widgets()
+        self.apply_styles()
 
     def apply_styles(self):
-        """Aplica la hoja de estilos QSS a la ventana."""
         self.setStyleSheet("""
-            QWidget#PopupWindow { /* Asegúrate de que el ID de objeto sea correcto */
-                background-color: #20202F; /* Fondo principal oscuro */
-                border-radius: 12px; /* Bordes redondeados para la ventana */
-                border: 1px solid #3A3A4A; /* Un pequeño borde sutil */
-            }
-
-            QLabel#popupTitle {
+            QWidget {
+                background-color: transparent;
                 color: #FFFFFF;
-                font-size: 16px;
-                font-weight: bold;
-                padding-bottom: 5px;
+                font-family: 'Segoe UI', sans-serif;
             }
-
-            QPushButton {
-                background-color: #4D4D5D; /* Botón gris oscuro */
+            QPushButton#discoverButton, QPushButton#groupButton {
+                background-color: rgba(255, 255, 255, 0.08);
+                border: 1px solid rgba(255, 255, 255, 0.08);
+                border-radius: 4px;
+                padding: 6px 12px;
                 color: #FFFFFF;
-                border-radius: 8px;
-                padding: 5px 10px;
-                font-size: 12px;
+                font-size: 13px;
+            }
+            QPushButton#discoverButton:hover, QPushButton#groupButton:hover {
+                background-color: rgba(255, 255, 255, 0.12);
+            }
+            QWidget#LampCard {
+                background-color: rgba(255, 255, 255, 0.06);
+                border: 1px solid rgba(255, 255, 255, 0.08);
+                border-radius: 4px;
+            }
+            QLabel#lampName {
+                color: #FFFFFF;
+                font-size: 13px;
+                font-weight: 600;
+            }
+            QLabel#controlLabel {
+                color: #E0E0E0;
+                font-size: 11px;
+            }
+            QLabel#valueLabel {
+                color: #A0A0A0;
+                font-size: 10px;
+            }
+            QSlider::groove:horizontal {
                 border: none;
+                height: 4px;
+                background: rgba(255, 255, 255, 0.1);
+                border-radius: 2px;
             }
-            QPushButton:hover {
-                background-color: #5A5A6A;
+            QSlider::handle:horizontal {
+                background: #FFFFFF;
+                border: none;
+                width: 12px;
+                height: 12px;
+                margin: -4px 0;
+                border-radius: 6px;
             }
-            QPushButton:pressed {
-                background-color: #3A3A4A;
+            QSlider::sub-page:horizontal {
+                background: #005FB8;
+                border-radius: 2px;
             }
-            QPushButton#discoverButton {
-                background-color: #7B68EE; /* Púrpura para el botón Discover */
+            QSlider#colorSlider::groove:horizontal {
+                background: qlineargradient(x1:0, y1:0, x2:1, y2:0,
+                    stop:0 #FF0000, stop:0.17 #FFFF00, stop:0.33 #00FF00,
+                    stop:0.5 #00FFFF, stop:0.67 #0000FF, stop:0.83 #FF00FF, stop:1 #FF0000);
+                height: 6px;
+                border-radius: 3px;
             }
-            QPushButton#discoverButton:hover {
-                background-color: #8C7DE1;
+            QSlider#colorSlider::sub-page:horizontal {
+                background: transparent;
             }
-            QPushButton#discoverButton:pressed {
-                background-color: #6B57D2;
-            }
-
             QScrollArea {
-                background-color: transparent; /* Fondo transparente para el área de scroll */
+                background-color: transparent;
                 border: none;
             }
-            
-            QWidget#lampListContainer {
-                background-color: transparent; /* El contenedor interno también transparente */
+            QScrollBar:vertical {
+                background: transparent;
+                width: 10px;
+                margin: 0px;
             }
-
-            QMessageBox {
-                background-color: #2D2D3D;
-                color: #FFFFFF;
-            }
-            QMessageBox QLabel {
-                color: #FFFFFF;
-            }
-            QMessageBox QPushButton {
-                background-color: #7B68EE;
-                color: #FFFFFF;
+            QScrollBar::handle:vertical {
+                background: rgba(255, 255, 255, 0.2);
+                min-height: 20px;
+                border-radius: 5px;
+                margin: 2px;
             }
         """)
-    def load_lamp_widgets(self):
-        """Carga los widgets de las lámparas guardadas."""
-        # Limpiar widgets antiguos
-        for i in reversed(range(self.lamp_list_layout.count() - 1)):
-            widget = self.lamp_list_layout.itemAt(i).widget()
-            if widget is not None:
+    def load_content(self):
+        # Limpiar contenido
+        for i in reversed(range(self.content_layout.count() - 1)):
+            widget = self.content_layout.itemAt(i).widget()
+            if widget:
                 widget.deleteLater()
         
-        # Cargar los nuevos widgets
-        for lamp_data in self.wiz_manager.get_lamps():
-            # Aseguramos que los datos esenciales existan antes de llamar a add_lamp_widget.
-            if 'mac' in lamp_data and 'ip' in lamp_data: 
-                self.add_lamp_widget(lamp_data)
-            else:
-                print(f"Advertencia: Saltando lámpara incompleta en JSON: {lamp_data}")
+        # Cargar luces individuales
+        for lamp in self.wiz_manager.get_lamps():
+            if 'mac' in lamp and 'ip' in lamp:
+                lamp_widget = LampControl(lamp, self.wiz_manager)
+                self.content_layout.insertWidget(self.content_layout.count() - 1, lamp_widget)
 
-    def add_lamp_widget(self, lamp_data):
-        """Agrega un nuevo widget de control de lámpara a la interfaz."""
-        # La verificación de seguridad que agregamos en la corrección anterior
-        if 'mac' not in lamp_data:
-            # Este mensaje ahora solo debería aparecer si hay un error en el flujo de ejecución.
-            print("Error: Intentando crear LampControl sin clave 'mac'.") 
-            return
-            
-        new_lamp = LampControl(lamp_data, self.wiz_manager)
-        # Insertar arriba de 'addStretch()'
-        self.lamp_list_layout.insertWidget(self.lamp_list_layout.count() - 1, new_lamp)
-        
+    def create_group(self):
+        dialog = GroupDialog(self.wiz_manager, self)
+        if dialog.exec() == QDialog.DialogCode.Accepted:
+            self.load_content()
+
     def start_discovery(self):
-        """Inicia el proceso de descubrimiento en un hilo."""
         self.discover_button.setEnabled(False)
         self.discover_button.setText("Buscando...")
-        
         self.discovery_thread = DiscoveryThread()
         self.discovery_thread.lamp_found.connect(self.handle_lamp_found)
         self.discovery_thread.finished.connect(self.discovery_finished)
         self.discovery_thread.start()
-        
+
     def handle_lamp_found(self, lamp_data):
-        """
-        CORRECCIÓN: Maneja la señal de una lámpara descubierta. 
-        Añade el widget SOLO si la lámpara se agregó exitosamente al manager y luego 
-        recupera los datos completos y guardados para construir la interfaz.
-        """
         mac = lamp_data.get('mac')
-        ip = lamp_data.get('ip')
-        name = lamp_data.get('name')
-        
-        if not mac:
-            print("Advertencia: Lámpara descubierta sin MAC válida. Ignorando respuesta incompleta.")
-            return
-
-        # Intenta añadir la lámpara al manager. Retorna True si es nueva.
-        if self.wiz_manager.add_lamp(mac, ip, name):
-            
-            # 🟢 CLAVE DE LA CORRECCIÓN: Recuperar los datos completos del diccionario 
-            # del manager, que ya están validados y tienen el estado inicial.
-            saved_lamp_data = self.wiz_manager.lamps.get(mac)
-            
-            if saved_lamp_data:
-                self.add_lamp_widget(saved_lamp_data)
-                print(f"Nueva lámpara descubierta y añadida: {name} ({ip})")
-            else:
-                # Este caso es muy improbable, pero cubre la falla de guardado.
-                print(f"Error crítico: Lámpara {mac} agregada al manager pero no se pudo recuperar.")
-
+        if mac and self.wiz_manager.add_lamp(mac, lamp_data.get('ip'), lamp_data.get('name')):
+            self.load_content()
 
     def discovery_finished(self):
-        """Se ejecuta cuando el hilo de descubrimiento termina."""
-        QMessageBox.information(self, "Descubrimiento", "Búsqueda de lámparas finalizada.")
+        QMessageBox.information(self, "Descubrimiento", "Búsqueda finalizada.")
         self.discover_button.setEnabled(True)
         self.discover_button.setText("Descubrir")
 
-# ----------------------------------------------------------------------
-# --- TRAY ICON Y EJECUCIÓN ---
-# ----------------------------------------------------------------------
+    def show_at_position(self, position: QPoint):
+        x = position.x() - self.width() - 10
+        y = position.y() - self.height() - 10
+        self.move(QPoint(x, y))
+        self.show()
+        self.raise_()
+        self.activateWindow()
+
+    def enterEvent(self, event):
+        self.hide_timer.stop()
+        super().enterEvent(event)
+
+    def leaveEvent(self, event):
+        self.hide_timer.start()
+        super().leaveEvent(event)
 
 class TrayAppQt:
     def __init__(self):
         self.app = QApplication(sys.argv)
         self.app.setQuitOnLastWindowClosed(False)
-
-        # Inicializar el manager de datos
         self.wiz_manager = WizManager()
 
-        # Icono de Bandeja
+        self.app.setFont(QFont("Segoe UI", 10))
+
         style = self.app.style()
         self.icon = QSystemTrayIcon(style.standardIcon(QStyle.StandardPixmap.SP_MessageBoxInformation))
-        self.icon.setToolTip("Control de Lámparas WiZ")
-        self.icon.setVisible(True)
-
-        # Menú de Contexto
+        self.icon.setToolTip("WiZ Light Controller")
+        
+        # Crear menú contextual primero
         menu = QMenu()
         show_action = QAction("Mostrar Control", menu)
         exit_action = QAction("Salir", menu)
         menu.addAction(show_action)
         menu.addAction(exit_action)
         self.icon.setContextMenu(menu)
-
-        # Ventana Pop-up
-        self.window = PopupWindow(self.wiz_manager)
         
+        # Mostrar ícono ANTES de crear la ventana
+        self.icon.setVisible(True)
+
+        self.window = PopupWindow(self.wiz_manager)
+
         # Conexiones
         self.icon.activated.connect(self.handle_icon_click)
-        show_action.triggered.connect(lambda: self.show_window(self.icon.contextMenu().pos())) 
+        show_action.triggered.connect(self.show_window)
         exit_action.triggered.connect(self.app.quit)
-        self.window.exit_button.clicked.connect(self.app.quit) 
-        
-        # Inicialización forzada del menú para el posicionamiento
-        self.icon.contextMenu() 
 
     def handle_icon_click(self, reason):
-        """Maneja el evento de clic izquierdo usando la posición del cursor."""
         if reason == QSystemTrayIcon.ActivationReason.Trigger:
-            cursor_pos = QCursor.pos()
-            self.show_window(cursor_pos)
+            self.show_window()
 
-    def show_window(self, tray_position: QPoint):
-        """Muestra y posiciona la ventana pop-up justo al lado del ícono."""
-        x = tray_position.x() - self.window.width() 
-        y = tray_position.y() - self.window.height() 
-        
-        self.window.move(QPoint(x, y))
-        self.window.show()
+    def show_window(self):
+        # Obtener posición del cursor como fallback
+        cursor_pos = QCursor.pos()
+        self.window.show_at_position(cursor_pos)
 
     def run(self):
         return self.app.exec()
 
 if __name__ == '__main__':
-    # Verificar si el sistema soporta UDP y Threads antes de ejecutar
-    if sys.platform == "win32" or sys.platform.startswith("linux"):
-        app = TrayAppQt()
-        sys.exit(app.run())
-    else:
-        print("Este código está optimizado para Windows o Linux.")
-        sys.exit(1)
+    app = TrayAppQt()
+    sys.exit(app.run())
