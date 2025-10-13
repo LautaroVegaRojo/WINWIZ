@@ -390,18 +390,101 @@ class PopupWindow(QWidget):
         super().__init__()
         self.wiz_manager = wiz_manager
         
-        self.setWindowTitle("WiZ Control")
-        self.setWindowFlags(Qt.WindowType.Tool | Qt.WindowType.FramelessWindowHint | Qt.WindowType.WindowStaysOnTopHint)
-        self.setAttribute(Qt.WidgetAttribute.WA_TranslucentBackground)
-        self.setGeometry(0, 0, 340, 450)  # Más compacta
+        # 1. TEMPORIZADOR DE ANIMACIÓN
+        self.animation = QPropertyAnimation(self, b"windowOpacity")
+        self.animation.setDuration(250)
+        self.animation.setEasingCurve(QEasingCurve.Type.InOutQuad)
+        self.animation.finished.connect(super().hide)
         
+        # 2. TEMPORIZADOR DE OCULTAMIENTO (Inicia la animación)
         self.hide_timer = QTimer(self)
         self.hide_timer.setInterval(400)
         self.hide_timer.setSingleShot(True)
-        self.hide_timer.timeout.connect(self.hide)
+        self.hide_timer.timeout.connect(self.start_hide_animation) 
+        
+        # 🚨 ¡AÑADE ESTO! TEMPORIZADOR DE MONITOREO (Para el área ampliada) 🚨
+        self.check_timer = QTimer(self)
+        self.check_timer.setInterval(100) # Chequea 10 veces por segundo
+        # Conexión a la función sin argumentos (la que calcula el rectángulo dinámicamente)
+        self.check_timer.timeout.connect(self.check_hover_area) 
+
+        # 3. CONFIGURACIÓN VISUAL
+        self.setWindowTitle("WiZ Control")
+        self.setWindowFlags(Qt.WindowType.Tool | Qt.WindowType.FramelessWindowHint | Qt.WindowType.WindowStaysOnTopHint)
+        self.setAttribute(Qt.WidgetAttribute.WA_TranslucentBackground)
+        self.setGeometry(0, 0, 340, 450) 
         
         self.setup_ui()
         self.load_content()
+        
+         # Nuevo método para iniciar la animación de ocultamiento
+    def start_hide_animation(self):
+        """Inicia el proceso de fundido a negro (fade out)."""
+        self.animation.stop()
+        self.animation.setStartValue(self.windowOpacity())
+        self.animation.setEndValue(0.0)
+        self.animation.start()
+
+    def show(self):
+        """Asegura la opacidad máxima al mostrar y detiene el monitoreo."""
+        self.setWindowOpacity(1.0)
+        if hasattr(self, 'check_timer') and self.check_timer.isActive():
+            self.check_timer.stop()
+        super().show()
+        
+    def hide(self):
+        # Este método ahora es un 'placeholder' ya que super().hide es llamado por la animación
+        pass 
+
+    def get_detection_rect(self) -> QRect:
+        """Calcula el rectángulo de detección ampliado (10% de margen) en coordenadas de pantalla."""
+        win_rect = self.frameGeometry()
+        
+        # El 10% del tamaño, convertido a entero (pixel count)
+        margin_x = int(win_rect.width() * 0.10)
+        margin_y = int(win_rect.height() * 0.10)
+        
+        # Expande el rectángulo por el margen en todas direcciones
+        return win_rect.adjusted(-margin_x, -margin_y, margin_x, margin_y)
+
+    def check_hover_area(self):
+        """Método llamado periódicamente por self.check_timer. Revisa si el cursor salió del área ampliada."""
+        detection_rect = self.get_detection_rect()
+        cursor_pos = QCursor.pos()
+
+        if not detection_rect.contains(cursor_pos):
+            # El mouse salió del área ampliada: detenemos el monitoreo e iniciamos el ocultamiento
+            self.check_timer.stop()
+            self.hide_timer.start()
+            
+    def enterEvent(self, event):
+        """Al reingresar el mouse, detiene cualquier ocultamiento o monitoreo."""
+        self.hide_timer.stop()
+        if hasattr(self, 'check_timer') and self.check_timer.isActive():
+            self.check_timer.stop()
+            
+        # Detiene la animación si el mouse regresa durante el fade out
+        self.animation.stop()
+        self.setWindowOpacity(1.0) 
+
+        super().enterEvent(event)
+
+    def leaveEvent(self, event):
+        """Al salir del área visible, comprueba si debe iniciar el monitoreo o el ocultamiento."""
+        detection_rect = self.get_detection_rect()
+        cursor_pos = QCursor.pos()
+        
+        if detection_rect.contains(cursor_pos):
+            # El mouse salió de lo visible, pero entró en el margen del 10%.
+            self.hide_timer.stop()
+            # Reiniciamos el chequeo para el nuevo rectángulo de detección.
+            self.check_timer.start() 
+        else:
+            # El mouse salió completamente del área ampliada.
+            self.hide_timer.start() 
+            
+        super().leaveEvent(event)
+
 
     def paintEvent(self, event):
         painter = QPainter(self)
@@ -578,13 +661,7 @@ class PopupWindow(QWidget):
         self.raise_()
         self.activateWindow()
 
-    def enterEvent(self, event):
-        self.hide_timer.stop()
-        super().enterEvent(event)
-
-    def leaveEvent(self, event):
-        self.hide_timer.start()
-        super().leaveEvent(event)
+   
 
 class TrayAppQt:
     def __init__(self):
