@@ -7,7 +7,7 @@ from PyQt6.QtWidgets import (
     QHBoxLayout, QSlider, QScrollArea, QFrame, QColorDialog, QCheckBox, QMessageBox, 
     QGraphicsDropShadowEffect, QLineEdit, QDialog, QListWidget, QListWidgetItem
 )
-from PyQt6.QtGui import QAction, QCursor, QColor, QFont, QPainter, QPen, QPainterPath, QIcon
+from PyQt6.QtGui import QAction, QCursor, QColor, QFont, QPainter, QPen, QPainterPath, QIcon, QPixmap
 from PyQt6.QtCore import (
     QPoint, Qt, QThread, pyqtSignal, QPropertyAnimation, QTimer, QRect, QEasingCurve, QRectF
 )
@@ -670,10 +670,14 @@ class TrayAppQt:
         self.wiz_manager = WizManager()
 
         self.app.setFont(QFont("Segoe UI", 10))
-
-        style = self.app.style()
-        self.icon = QSystemTrayIcon(style.standardIcon(QStyle.StandardPixmap.SP_MessageBoxInformation))
-        self.icon.setToolTip("WiZ Light Controller")
+        
+        icon_path = "icon.ico"
+        icon_pixmap = QPixmap(icon_path)
+        if icon_pixmap.isNull():
+            print(f"Error: No se pudo cargar el icono desde '{icon_path}'")
+            return
+        icon = QIcon(icon_pixmap)
+        self.icon = QSystemTrayIcon(icon)  # ✅ Correcto
         
         # Crear menú contextual primero
         menu = QMenu()
@@ -681,15 +685,15 @@ class TrayAppQt:
         exit_action = QAction("Salir", menu)
         menu.addAction(show_action)
         menu.addAction(exit_action)
-        self.icon.setContextMenu(menu)
+        self.icon.setContextMenu(menu)  # ✅ Correcto
         
         # Mostrar ícono ANTES de crear la ventana
-        self.icon.setVisible(True)
+        self.icon.setVisible(True)  # ✅ Correcto
 
         self.window = PopupWindow(self.wiz_manager)
 
         # Conexiones
-        self.icon.activated.connect(self.handle_icon_click)
+        self.icon.activated.connect(self.handle_icon_click)  # ✅ Correcto
         show_action.triggered.connect(self.show_window)
         exit_action.triggered.connect(self.app.quit)
 

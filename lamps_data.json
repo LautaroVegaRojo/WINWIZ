@@ -4,33 +4,33 @@
             "ip": "192.168.68.51",
             "name": "WiZ-57eba2",
             "mac": "d8a01157eba2",
-            "last_brightness": 10,
+            "last_brightness": 100,
             "last_color_hex": "#ffffff",
-            "last_temp_kelvin": 2700
+            "last_temp_kelvin": 2200
         },
         "d8a01157fb36": {
             "ip": "192.168.68.57",
             "name": "WiZ-57fb36",
             "mac": "d8a01157fb36",
-            "last_brightness": 64,
-            "last_color_hex": "#ffffff",
-            "last_temp_kelvin": 2700
+            "last_brightness": 10,
+            "last_color_hex": "#00a2ff",
+            "last_temp_kelvin": 2200
         },
         "d8a01157fbe4": {
             "ip": "192.168.68.62",
             "name": "WiZ-57fbe4",
             "mac": "d8a01157fbe4",
-            "last_brightness": 73,
+            "last_brightness": 10,
             "last_color_hex": "#ffffff",
-            "last_temp_kelvin": 2700
+            "last_temp_kelvin": 2200
         },
         "d8a01157f514": {
             "ip": "192.168.68.55",
             "name": "WiZ-57f514",
             "mac": "d8a01157f514",
-            "last_brightness": 100,
+            "last_brightness": 10,
             "last_color_hex": "#ffffff",
-            "last_temp_kelvin": 2700
+            "last_temp_kelvin": 2200
         }
     },
     "groups": {
