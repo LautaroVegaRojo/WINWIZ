@@ -11,6 +11,7 @@ from PyQt6.QtGui import QAction, QCursor, QColor, QFont, QPainter, QPen, QPainte
 from PyQt6.QtCore import (
     QPoint, Qt, QThread, pyqtSignal, QPropertyAnimation, QTimer, QRect, QEasingCurve, QRectF
 )
+import time
 
 TEMP_MIN = 2200
 TEMP_MAX = 6500
@@ -25,31 +26,36 @@ class DiscoveryThread(QThread):
 
         sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
         sock.setsockopt(socket.SOL_SOCKET, socket.SO_BROADCAST, 1)
-        sock.settimeout(3)  # Timeout de 3 segundos como el original
+        sock.settimeout(1)  # Timeout más corto por cada recvfrom
 
-        discovered_macs = set()  # Para evitar duplicados
+        discovered_macs = set()
+        start_time = time.time()
 
         try:
             sock.sendto(DISCOVERY_MESSAGE, (BROADCAST_IP, UDP_PORT))
-            
-            # Seguir escuchando hasta timeout (como el código original)
-            while True:
+
+            while time.time() - start_time < 3:  # Escuchar durante 3 segundos
                 try:
                     data, addr = sock.recvfrom(1024)
-                    response = json.loads(data.decode('utf-8'))
+                    try:
+                        response = json.loads(data.decode('utf-8'))
+                    except json.JSONDecodeError:
+                        continue
                     mac = response.get('result', {}).get('mac')
                     ip = addr[0]
-                    
+
                     if mac and ip and mac not in discovered_macs:
                         discovered_macs.add(mac)
-                        self.lamp_found.emit({'ip': ip, 'mac': mac, 'name': f"WiZ-{mac[-6:]}"})
+                        cleaned_mac = mac.replace(':', '')
+                        name = f"WiZ-{cleaned_mac[-6:]}"
+                        self.lamp_found.emit({'ip': ip, 'mac': mac, 'name': name})
                 except socket.timeout:
-                    break  # Sale del bucle cuando no hay más respuestas
+                    pass
                 except Exception:
                     continue
         finally:
             sock.close()
-
+            
 class WizManager:
     DATA_FILE = 'lamps_data.json'
 
