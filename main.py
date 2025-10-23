@@ -149,6 +149,83 @@ class WizManager:
         for lamp in lamps:
             self.send_command(lamp['ip'], command_params)
 
+class ImprovedSlider(QSlider):
+    """Slider mejorado que sigue al mouse incluso fuera del área"""
+    
+    valueChangedDelayed = pyqtSignal(int)  # Nueva señal con delay
+    
+    def __init__(self, orientation, parent=None):
+        super().__init__(orientation, parent)
+        self._is_dragging = False
+        
+        # Timer para retrasar el envío de comandos
+        self._update_timer = QTimer(self)
+        self._update_timer.setSingleShot(True)
+        self._update_timer.setInterval(50)  # 50ms de delay
+        self._update_timer.timeout.connect(self._emit_delayed_value)
+        
+        # Conectar el valueChanged original al timer
+        self.valueChanged.connect(self._on_value_changed)
+        
+    def _on_value_changed(self, value):
+        """Se llama cada vez que cambia el valor"""
+        # Si estamos arrastrando, reiniciar el timer
+        if self._is_dragging:
+            self._update_timer.start()
+        else:
+            # Si no estamos arrastrando (click directo), emitir inmediatamente
+            self.valueChangedDelayed.emit(value)
+    
+    def _emit_delayed_value(self):
+        """Emite el valor después del delay"""
+        self.valueChangedDelayed.emit(self.value())
+        
+    def mousePressEvent(self, event):
+        if event.button() == Qt.MouseButton.LeftButton:
+            self._is_dragging = True
+            # Calcular y establecer el valor según la posición del click
+            self._update_value_from_position(event.pos())
+            event.accept()
+        else:
+            super().mousePressEvent(event)
+    
+    def mouseMoveEvent(self, event):
+        if self._is_dragging:
+            self._update_value_from_position(event.pos())
+            event.accept()
+        else:
+            super().mouseMoveEvent(event)
+    
+    def mouseReleaseEvent(self, event):
+        if event.button() == Qt.MouseButton.LeftButton:
+            self._is_dragging = False
+            # Al soltar, emitir el valor final inmediatamente
+            self._update_timer.stop()
+            self.valueChangedDelayed.emit(self.value())
+            event.accept()
+        else:
+            super().mouseReleaseEvent(event)
+    
+    def _update_value_from_position(self, pos):
+        """Calcula el valor del slider según la posición del mouse"""
+        if self.orientation() == Qt.Orientation.Horizontal:
+            # Calcular el porcentaje de la posición en el ancho del slider
+            groove_width = self.width()
+            position = max(0, min(pos.x(), groove_width))
+            percentage = position / groove_width
+        else:
+            # Para sliders verticales
+            groove_height = self.height()
+            position = max(0, min(pos.y(), groove_height))
+            percentage = 1.0 - (position / groove_height)  # Invertido para vertical
+        
+        # Convertir el porcentaje al rango del slider
+        value_range = self.maximum() - self.minimum()
+        new_value = int(self.minimum() + (percentage * value_range))
+        
+        # Establecer el valor
+        self.setValue(new_value)
+
 class ModernToggle(QWidget):
     stateChanged = pyqtSignal(int)
     
@@ -241,10 +318,11 @@ class LampControl(QWidget):
         bright_label.setStyleSheet("font-size: 12px; color: #E0E0E0;")
         brightness_layout.addWidget(bright_label)
         
-        self.brightness_slider = QSlider(Qt.Orientation.Horizontal)
+        self.brightness_slider = ImprovedSlider(Qt.Orientation.Horizontal)
         self.brightness_slider.setRange(10, 100)
         self.brightness_slider.setValue(initial_brightness)
-        self.brightness_slider.valueChanged.connect(self.send_brightness_command)
+        self.brightness_slider.valueChangedDelayed.connect(self.send_brightness_command)
+        self.brightness_slider.valueChanged.connect(self.update_brightness_label)
         brightness_layout.addWidget(self.brightness_slider)
         
         self.brightness_value = QLabel(f"{initial_brightness}%")
@@ -263,10 +341,11 @@ class LampControl(QWidget):
         temp_label.setStyleSheet("font-size: 12px; color: #E0E0E0;")
         temp_layout.addWidget(temp_label)
         
-        self.temp_slider = QSlider(Qt.Orientation.Horizontal)
+        self.temp_slider = ImprovedSlider(Qt.Orientation.Horizontal)
         self.temp_slider.setRange(0, 100)
         self.temp_slider.setValue(self.kelvin_to_slider(self.current_temp))
-        self.temp_slider.valueChanged.connect(self.send_temp_command)
+        self.temp_slider.valueChangedDelayed.connect(self.send_temp_command)
+        self.temp_slider.valueChanged.connect(self.update_temp_label)
         temp_layout.addWidget(self.temp_slider)
         
         self.temp_value = QLabel(f"{self.current_temp}K")
@@ -285,11 +364,12 @@ class LampControl(QWidget):
         color_label.setStyleSheet("font-size: 12px; color: #E0E0E0;")
         color_layout.addWidget(color_label)
         
-        self.color_slider = QSlider(Qt.Orientation.Horizontal)
+        self.color_slider = ImprovedSlider(Qt.Orientation.Horizontal)
         self.color_slider.setRange(0, 359)
         self.color_slider.setValue(self.current_hue)
         self.color_slider.setObjectName("colorSlider")
-        self.color_slider.valueChanged.connect(self.send_color_command)
+        self.color_slider.valueChangedDelayed.connect(self.send_color_command)
+        self.color_slider.valueChanged.connect(self.update_color_preview_only)
         color_layout.addWidget(self.color_slider)
         
         self.color_preview = QLabel()
@@ -315,6 +395,27 @@ class LampControl(QWidget):
     def slider_to_kelvin(self, slider_val):
         return int(((slider_val / 100) * (TEMP_MAX - TEMP_MIN)) + TEMP_MIN)
 
+    def update_brightness_label(self, value):
+        """Actualiza solo el label sin enviar comando"""
+        self.brightness_value.setText(f"{value}%")
+    
+    def update_temp_label(self, slider_val):
+        """Actualiza solo el label sin enviar comando"""
+        kelvin = self.slider_to_kelvin(slider_val)
+        self.temp_value.setText(f"{kelvin}K")
+    
+    def update_color_preview_only(self, hue):
+        """Actualiza solo el preview sin enviar comando"""
+        self.current_hue = hue
+        color = QColor.fromHsv(hue, 255, 255)
+        self.color_preview.setStyleSheet(f"""
+            QLabel {{
+                background-color: {color.name()};
+                border: 1px solid rgba(255,255,255,0.2);
+                border-radius: 4px;
+            }}
+        """)
+
     def send_toggle_command(self, state):
         is_on = state == Qt.CheckState.Checked.value
         self.is_on = is_on
@@ -323,7 +424,6 @@ class LampControl(QWidget):
         self.wiz_manager.send_command(self.ip, command)
 
     def send_brightness_command(self, value):
-        self.brightness_value.setText(f"{value}%")
         self.wiz_manager.update_lamp_state(self.mac, brightness=value)
         if not self.is_on:
             self.toggle.setChecked(True)
@@ -333,7 +433,6 @@ class LampControl(QWidget):
     def send_temp_command(self, slider_val):
         kelvin = self.slider_to_kelvin(slider_val)
         self.current_temp = kelvin
-        self.temp_value.setText(f"{kelvin}K")
         self.wiz_manager.update_lamp_state(self.mac, last_temp_kelvin=kelvin)
         if not self.is_on:
             self.toggle.setChecked(True)
@@ -347,7 +446,6 @@ class LampControl(QWidget):
         self.current_hue = hue
         color = QColor.fromHsv(hue, 255, 255)
         self.current_color = color
-        self.update_color_preview()
         
         self.wiz_manager.update_lamp_state(self.mac, color_hex=color.name())
         if not self.is_on:
@@ -362,7 +460,7 @@ class LampControl(QWidget):
         self.wiz_manager.send_command(self.ip, command)
 
 class GroupControl(QWidget):
-    """Control para un grupo de lámparas con expansión/colapso"""
+    """Control para un grupo de lámparas con expansión/colapso y controles completos"""
     
     def __init__(self, group_name, wiz_manager, parent=None):
         super().__init__(parent)
@@ -370,6 +468,13 @@ class GroupControl(QWidget):
         self.wiz_manager = wiz_manager
         self.is_expanded = False
         self.lamp_widgets = []
+        
+        # Estado inicial del grupo
+        self.is_on = True
+        self.current_brightness = 100
+        self.current_temp = 2700
+        self.current_hue = 0
+        self.current_color = QColor.fromHsv(0, 255, 255)
         
         self.setObjectName("GroupCard")
         self.setup_ui()
@@ -379,18 +484,29 @@ class GroupControl(QWidget):
         main_layout.setContentsMargins(12, 10, 12, 10)
         main_layout.setSpacing(8)
         
-        # Header expandible
+        # Header con flecha expandible
         header = QWidget()
-        header.setCursor(Qt.CursorShape.PointingHandCursor)
         header_layout = QHBoxLayout(header)
         header_layout.setContentsMargins(0, 0, 0, 0)
         header_layout.setSpacing(8)
         
-        # Flecha de expansión
+        # Flecha de expansión (solo la flecha es clickeable)
+        arrow_container = QWidget()
+        arrow_container.setCursor(Qt.CursorShape.PointingHandCursor)
+        arrow_layout = QHBoxLayout(arrow_container)
+        arrow_layout.setContentsMargins(0, 0, 0, 0)
+        
         self.arrow_label = QLabel("▶")
         self.arrow_label.setFixedWidth(16)
         self.arrow_label.setStyleSheet("font-size: 10px; color: #E0E0E0;")
-        header_layout.addWidget(self.arrow_label)
+        arrow_layout.addWidget(self.arrow_label)
+        
+        def arrow_click(e):
+            if e.button() == Qt.MouseButton.LeftButton:
+                self.toggle_expansion()
+        arrow_container.mousePressEvent = arrow_click
+        
+        header_layout.addWidget(arrow_container)
         
         # Nombre del grupo
         name_label = QLabel(f"🗂 {self.group_name}")
@@ -407,28 +523,130 @@ class GroupControl(QWidget):
         
         # Toggle para todo el grupo
         self.toggle = ModernToggle()
+        self.toggle.setChecked(self.is_on)
         self.toggle.stateChanged.connect(self.send_toggle_command)
         header_layout.addWidget(self.toggle)
         
-        # Click en el header para expandir/colapsar
-        def header_click(e):
-            if e.button() == Qt.MouseButton.LeftButton:
-                self.toggle_expansion()
-        header.mousePressEvent = header_click
-        
         main_layout.addWidget(header)
         
-        # Contenedor de lámparas (inicialmente oculto)
+        # Controles del grupo (como una lámpara)
+        # Brillo
+        brightness_layout = QHBoxLayout()
+        brightness_layout.setSpacing(8)
+        
+        bright_label = QLabel("☀")
+        bright_label.setFixedWidth(16)
+        bright_label.setStyleSheet("font-size: 12px; color: #E0E0E0;")
+        brightness_layout.addWidget(bright_label)
+        
+        self.brightness_slider = ImprovedSlider(Qt.Orientation.Horizontal)
+        self.brightness_slider.setRange(10, 100)
+        self.brightness_slider.setValue(self.current_brightness)
+        self.brightness_slider.valueChangedDelayed.connect(self.send_brightness_command)
+        self.brightness_slider.valueChanged.connect(self.update_brightness_label)
+        brightness_layout.addWidget(self.brightness_slider)
+        
+        self.brightness_value = QLabel(f"{self.current_brightness}%")
+        self.brightness_value.setObjectName("valueLabel")
+        self.brightness_value.setFixedWidth(35)
+        brightness_layout.addWidget(self.brightness_value)
+        
+        main_layout.addLayout(brightness_layout)
+        
+        # Temperatura
+        temp_layout = QHBoxLayout()
+        temp_layout.setSpacing(8)
+        
+        temp_label = QLabel("◐")
+        temp_label.setFixedWidth(16)
+        temp_label.setStyleSheet("font-size: 12px; color: #E0E0E0;")
+        temp_layout.addWidget(temp_label)
+        
+        self.temp_slider = ImprovedSlider(Qt.Orientation.Horizontal)
+        self.temp_slider.setRange(0, 100)
+        self.temp_slider.setValue(self.kelvin_to_slider(self.current_temp))
+        self.temp_slider.valueChangedDelayed.connect(self.send_temp_command)
+        self.temp_slider.valueChanged.connect(self.update_temp_label)
+        temp_layout.addWidget(self.temp_slider)
+        
+        self.temp_value = QLabel(f"{self.current_temp}K")
+        self.temp_value.setObjectName("valueLabel")
+        self.temp_value.setFixedWidth(35)
+        temp_layout.addWidget(self.temp_value)
+        
+        main_layout.addLayout(temp_layout)
+        
+        # Color
+        color_layout = QHBoxLayout()
+        color_layout.setSpacing(8)
+        
+        color_label = QLabel("●")
+        color_label.setFixedWidth(16)
+        color_label.setStyleSheet("font-size: 12px; color: #E0E0E0;")
+        color_layout.addWidget(color_label)
+        
+        self.color_slider = ImprovedSlider(Qt.Orientation.Horizontal)
+        self.color_slider.setRange(0, 359)
+        self.color_slider.setValue(self.current_hue)
+        self.color_slider.setObjectName("colorSlider")
+        self.color_slider.valueChangedDelayed.connect(self.send_color_command)
+        self.color_slider.valueChanged.connect(self.update_color_preview_only)
+        color_layout.addWidget(self.color_slider)
+        
+        self.color_preview = QLabel()
+        self.color_preview.setFixedSize(35, 20)
+        self.update_color_preview()
+        color_layout.addWidget(self.color_preview)
+        
+        main_layout.addLayout(color_layout)
+        
+        # Contenedor de lámparas individuales (inicialmente oculto)
         self.lamps_container = QWidget()
         self.lamps_layout = QVBoxLayout(self.lamps_container)
-        self.lamps_layout.setContentsMargins(20, 0, 0, 0)  # Indentación
+        self.lamps_layout.setContentsMargins(20, 8, 0, 0)  # Indentación
         self.lamps_layout.setSpacing(6)
         self.lamps_container.hide()
         
         main_layout.addWidget(self.lamps_container)
         
-        # Crear controles de las lámparas
+        # Crear controles de las lámparas individuales
         self.create_lamp_controls()
+    
+    def kelvin_to_slider(self, kelvin):
+        return int(((kelvin - TEMP_MIN) / (TEMP_MAX - TEMP_MIN)) * 100)
+
+    def slider_to_kelvin(self, slider_val):
+        return int(((slider_val / 100) * (TEMP_MAX - TEMP_MIN)) + TEMP_MIN)
+    
+    def update_brightness_label(self, value):
+        """Actualiza solo el label sin enviar comando"""
+        self.brightness_value.setText(f"{value}%")
+    
+    def update_temp_label(self, slider_val):
+        """Actualiza solo el label sin enviar comando"""
+        kelvin = self.slider_to_kelvin(slider_val)
+        self.temp_value.setText(f"{kelvin}K")
+    
+    def update_color_preview_only(self, hue):
+        """Actualiza solo el preview sin enviar comando"""
+        color = QColor.fromHsv(hue, 255, 255)
+        self.color_preview.setStyleSheet(f"""
+            QLabel {{
+                background-color: {color.name()};
+                border: 1px solid rgba(255,255,255,0.2);
+                border-radius: 4px;
+            }}
+        """)
+    
+    def update_color_preview(self):
+        color = QColor.fromHsv(self.current_hue, 255, 255)
+        self.color_preview.setStyleSheet(f"""
+            QLabel {{
+                background-color: {color.name()};
+                border: 1px solid rgba(255,255,255,0.2);
+                border-radius: 4px;
+            }}
+        """)
     
     def create_lamp_controls(self):
         """Crea los controles para cada lámpara del grupo"""
@@ -452,12 +670,82 @@ class GroupControl(QWidget):
     def send_toggle_command(self, state):
         """Envía comando de encendido/apagado a todas las lámparas del grupo"""
         is_on = state == Qt.CheckState.Checked.value
-        command = {"method": "setPilot", "params": {"state": is_on}}
+        self.is_on = is_on
+        dimming = self.brightness_slider.value() if is_on else 100
+        command = {"method": "setPilot", "params": {"state": is_on, "dimming": dimming}}
         self.wiz_manager.send_command_to_group(self.group_name, command)
         
         # Actualizar toggles de las lámparas individuales
         for lamp_widget in self.lamp_widgets:
             lamp_widget.toggle.setChecked(is_on)
+    
+    def send_brightness_command(self, value):
+        """Envía comando de brillo a todas las lámparas del grupo"""
+        self.current_brightness = value
+        self.brightness_value.setText(f"{value}%")
+        
+        if not self.is_on:
+            self.toggle.setChecked(True)
+        
+        command = {"method": "setPilot", "params": {"dimming": value, "state": True}}
+        self.wiz_manager.send_command_to_group(self.group_name, command)
+        
+        # Actualizar sliders de las lámparas individuales
+        for lamp_widget in self.lamp_widgets:
+            lamp_widget.brightness_slider.blockSignals(True)
+            lamp_widget.brightness_slider.setValue(value)
+            lamp_widget.brightness_value.setText(f"{value}%")
+            lamp_widget.brightness_slider.blockSignals(False)
+    
+    def send_temp_command(self, slider_val):
+        """Envía comando de temperatura a todas las lámparas del grupo"""
+        kelvin = self.slider_to_kelvin(slider_val)
+        self.current_temp = kelvin
+        self.temp_value.setText(f"{kelvin}K")
+        
+        if not self.is_on:
+            self.toggle.setChecked(True)
+        
+        command = {
+            "method": "setPilot",
+            "params": {"temp": int(kelvin), "dimming": self.brightness_slider.value(), "state": True, "colorMode": "temp"}
+        }
+        self.wiz_manager.send_command_to_group(self.group_name, command)
+        
+        # Actualizar sliders de las lámparas individuales
+        for lamp_widget in self.lamp_widgets:
+            lamp_widget.temp_slider.blockSignals(True)
+            lamp_widget.temp_slider.setValue(slider_val)
+            lamp_widget.temp_value.setText(f"{kelvin}K")
+            lamp_widget.current_temp = kelvin
+            lamp_widget.temp_slider.blockSignals(False)
+    
+    def send_color_command(self, hue):
+        """Envía comando de color a todas las lámparas del grupo"""
+        self.current_hue = hue
+        color = QColor.fromHsv(hue, 255, 255)
+        self.current_color = color
+        self.update_color_preview()
+        
+        if not self.is_on:
+            self.toggle.setChecked(True)
+        
+        r, g, b = color.red(), color.green(), color.blue()
+        dimming = self.brightness_slider.value()
+        command = {
+            "method": "setPilot",
+            "params": {"r": int(r), "g": int(g), "b": int(b), "dimming": int(dimming), "state": True, "colorMode": "rgb"}
+        }
+        self.wiz_manager.send_command_to_group(self.group_name, command)
+        
+        # Actualizar sliders de las lámparas individuales
+        for lamp_widget in self.lamp_widgets:
+            lamp_widget.color_slider.blockSignals(True)
+            lamp_widget.color_slider.setValue(hue)
+            lamp_widget.current_hue = hue
+            lamp_widget.current_color = color
+            lamp_widget.update_color_preview()
+            lamp_widget.color_slider.blockSignals(False)
 
 class GroupDialog(QDialog):
     def __init__(self, wiz_manager, parent=None):
