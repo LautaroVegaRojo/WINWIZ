@@ -26,7 +26,7 @@ class DiscoveryThread(QThread):
 
         sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
         sock.setsockopt(socket.SOL_SOCKET, socket.SO_BROADCAST, 1)
-        sock.settimeout(1)  # Timeout más corto por cada recvfrom
+        sock.settimeout(1)
 
         discovered_macs = set()
         start_time = time.time()
@@ -34,7 +34,7 @@ class DiscoveryThread(QThread):
         try:
             sock.sendto(DISCOVERY_MESSAGE, (BROADCAST_IP, UDP_PORT))
 
-            while time.time() - start_time < 3:  # Escuchar durante 3 segundos
+            while time.time() - start_time < 3:
                 try:
                     data, addr = sock.recvfrom(1024)
                     try:
@@ -103,6 +103,14 @@ class WizManager:
     def get_lamps_in_group(self, group_name):
         lamp_macs = self.groups.get(group_name, [])
         return [self.lamps[mac] for mac in lamp_macs if mac in self.lamps]
+    
+    def get_lamp_groups(self, mac):
+        """Retorna lista de nombres de grupos que contienen esta lámpara"""
+        groups = []
+        for group_name, lamp_macs in self.groups.items():
+            if mac in lamp_macs:
+                groups.append(group_name)
+        return groups
 
     def update_lamp_state(self, mac, brightness=None, color_hex=None, last_temp_kelvin=None):
         if mac in self.lamps:
@@ -116,19 +124,32 @@ class WizManager:
 
     def get_lamps(self):
         return list(self.lamps.values())
+    
+    def get_ungrouped_lamps(self):
+        """Retorna lámparas que no pertenecen a ningún grupo"""
+        grouped_macs = set()
+        for lamp_macs in self.groups.values():
+            grouped_macs.update(lamp_macs)
+        
+        return [lamp for lamp in self.lamps.values() if lamp['mac'] not in grouped_macs]
 
     def send_command(self, ip, command_params):
         try:
             sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-            sock.settimeout(0.05)  # Timeout más corto para mejor rendimiento
+            sock.settimeout(0.05)
             command_json = json.dumps(command_params).encode('utf-8')
             sock.sendto(command_json, (ip, 38899))
             sock.close()
         except Exception:
             pass
+    
+    def send_command_to_group(self, group_name, command_params):
+        """Envía un comando a todas las lámparas de un grupo"""
+        lamps = self.get_lamps_in_group(group_name)
+        for lamp in lamps:
+            self.send_command(lamp['ip'], command_params)
 
 class ModernToggle(QWidget):
-    """Toggle clickeable en toda su área"""
     stateChanged = pyqtSignal(int)
     
     def __init__(self, parent=None):
@@ -340,6 +361,104 @@ class LampControl(QWidget):
         }
         self.wiz_manager.send_command(self.ip, command)
 
+class GroupControl(QWidget):
+    """Control para un grupo de lámparas con expansión/colapso"""
+    
+    def __init__(self, group_name, wiz_manager, parent=None):
+        super().__init__(parent)
+        self.group_name = group_name
+        self.wiz_manager = wiz_manager
+        self.is_expanded = False
+        self.lamp_widgets = []
+        
+        self.setObjectName("GroupCard")
+        self.setup_ui()
+    
+    def setup_ui(self):
+        main_layout = QVBoxLayout(self)
+        main_layout.setContentsMargins(12, 10, 12, 10)
+        main_layout.setSpacing(8)
+        
+        # Header expandible
+        header = QWidget()
+        header.setCursor(Qt.CursorShape.PointingHandCursor)
+        header_layout = QHBoxLayout(header)
+        header_layout.setContentsMargins(0, 0, 0, 0)
+        header_layout.setSpacing(8)
+        
+        # Flecha de expansión
+        self.arrow_label = QLabel("▶")
+        self.arrow_label.setFixedWidth(16)
+        self.arrow_label.setStyleSheet("font-size: 10px; color: #E0E0E0;")
+        header_layout.addWidget(self.arrow_label)
+        
+        # Nombre del grupo
+        name_label = QLabel(f"🗂 {self.group_name}")
+        name_label.setObjectName("groupName")
+        header_layout.addWidget(name_label)
+        
+        # Contador de lámparas
+        lamp_count = len(self.wiz_manager.get_lamps_in_group(self.group_name))
+        count_label = QLabel(f"({lamp_count})")
+        count_label.setObjectName("lampCount")
+        header_layout.addWidget(count_label)
+        
+        header_layout.addStretch()
+        
+        # Toggle para todo el grupo
+        self.toggle = ModernToggle()
+        self.toggle.stateChanged.connect(self.send_toggle_command)
+        header_layout.addWidget(self.toggle)
+        
+        # Click en el header para expandir/colapsar
+        def header_click(e):
+            if e.button() == Qt.MouseButton.LeftButton:
+                self.toggle_expansion()
+        header.mousePressEvent = header_click
+        
+        main_layout.addWidget(header)
+        
+        # Contenedor de lámparas (inicialmente oculto)
+        self.lamps_container = QWidget()
+        self.lamps_layout = QVBoxLayout(self.lamps_container)
+        self.lamps_layout.setContentsMargins(20, 0, 0, 0)  # Indentación
+        self.lamps_layout.setSpacing(6)
+        self.lamps_container.hide()
+        
+        main_layout.addWidget(self.lamps_container)
+        
+        # Crear controles de las lámparas
+        self.create_lamp_controls()
+    
+    def create_lamp_controls(self):
+        """Crea los controles para cada lámpara del grupo"""
+        lamps = self.wiz_manager.get_lamps_in_group(self.group_name)
+        for lamp in lamps:
+            lamp_widget = LampControl(lamp, self.wiz_manager)
+            self.lamps_layout.addWidget(lamp_widget)
+            self.lamp_widgets.append(lamp_widget)
+    
+    def toggle_expansion(self):
+        """Alterna entre expandido y colapsado"""
+        self.is_expanded = not self.is_expanded
+        
+        if self.is_expanded:
+            self.arrow_label.setText("▼")
+            self.lamps_container.show()
+        else:
+            self.arrow_label.setText("▶")
+            self.lamps_container.hide()
+    
+    def send_toggle_command(self, state):
+        """Envía comando de encendido/apagado a todas las lámparas del grupo"""
+        is_on = state == Qt.CheckState.Checked.value
+        command = {"method": "setPilot", "params": {"state": is_on}}
+        self.wiz_manager.send_command_to_group(self.group_name, command)
+        
+        # Actualizar toggles de las lámparas individuales
+        for lamp_widget in self.lamp_widgets:
+            lamp_widget.toggle.setChecked(is_on)
+
 class GroupDialog(QDialog):
     def __init__(self, wiz_manager, parent=None):
         super().__init__(parent)
@@ -396,25 +515,20 @@ class PopupWindow(QWidget):
         super().__init__()
         self.wiz_manager = wiz_manager
         
-        # 1. TEMPORIZADOR DE ANIMACIÓN
         self.animation = QPropertyAnimation(self, b"windowOpacity")
         self.animation.setDuration(250)
         self.animation.setEasingCurve(QEasingCurve.Type.InOutQuad)
         self.animation.finished.connect(super().hide)
         
-        # 2. TEMPORIZADOR DE OCULTAMIENTO (Inicia la animación)
         self.hide_timer = QTimer(self)
         self.hide_timer.setInterval(400)
         self.hide_timer.setSingleShot(True)
         self.hide_timer.timeout.connect(self.start_hide_animation) 
         
-        # 🚨 ¡AÑADE ESTO! TEMPORIZADOR DE MONITOREO (Para el área ampliada) 🚨
         self.check_timer = QTimer(self)
-        self.check_timer.setInterval(100) # Chequea 10 veces por segundo
-        # Conexión a la función sin argumentos (la que calcula el rectángulo dinámicamente)
+        self.check_timer.setInterval(100)
         self.check_timer.timeout.connect(self.check_hover_area) 
 
-        # 3. CONFIGURACIÓN VISUAL
         self.setWindowTitle("WiZ Control")
         self.setWindowFlags(Qt.WindowType.Tool | Qt.WindowType.FramelessWindowHint | Qt.WindowType.WindowStaysOnTopHint)
         self.setAttribute(Qt.WidgetAttribute.WA_TranslucentBackground)
@@ -423,74 +537,53 @@ class PopupWindow(QWidget):
         self.setup_ui()
         self.load_content()
         
-         # Nuevo método para iniciar la animación de ocultamiento
     def start_hide_animation(self):
-        """Inicia el proceso de fundido a negro (fade out)."""
         self.animation.stop()
         self.animation.setStartValue(self.windowOpacity())
         self.animation.setEndValue(0.0)
         self.animation.start()
 
     def show(self):
-        """Asegura la opacidad máxima al mostrar y detiene el monitoreo."""
         self.setWindowOpacity(1.0)
         if hasattr(self, 'check_timer') and self.check_timer.isActive():
             self.check_timer.stop()
         super().show()
         
     def hide(self):
-        # Este método ahora es un 'placeholder' ya que super().hide es llamado por la animación
         pass 
 
     def get_detection_rect(self) -> QRect:
-        """Calcula el rectángulo de detección ampliado (10% de margen) en coordenadas de pantalla."""
         win_rect = self.frameGeometry()
-        
-        # El 10% del tamaño, convertido a entero (pixel count)
         margin_x = int(win_rect.width() * 0.10)
         margin_y = int(win_rect.height() * 0.10)
-        
-        # Expande el rectángulo por el margen en todas direcciones
         return win_rect.adjusted(-margin_x, -margin_y, margin_x, margin_y)
 
     def check_hover_area(self):
-        """Método llamado periódicamente por self.check_timer. Revisa si el cursor salió del área ampliada."""
         detection_rect = self.get_detection_rect()
         cursor_pos = QCursor.pos()
 
         if not detection_rect.contains(cursor_pos):
-            # El mouse salió del área ampliada: detenemos el monitoreo e iniciamos el ocultamiento
             self.check_timer.stop()
             self.hide_timer.start()
             
     def enterEvent(self, event):
-        """Al reingresar el mouse, detiene cualquier ocultamiento o monitoreo."""
         self.hide_timer.stop()
         if hasattr(self, 'check_timer') and self.check_timer.isActive():
             self.check_timer.stop()
-            
-        # Detiene la animación si el mouse regresa durante el fade out
         self.animation.stop()
         self.setWindowOpacity(1.0) 
-
         super().enterEvent(event)
 
     def leaveEvent(self, event):
-        """Al salir del área visible, comprueba si debe iniciar el monitoreo o el ocultamiento."""
         detection_rect = self.get_detection_rect()
         cursor_pos = QCursor.pos()
         
         if detection_rect.contains(cursor_pos):
-            # El mouse salió de lo visible, pero entró en el margen del 10%.
             self.hide_timer.stop()
-            # Reiniciamos el chequeo para el nuevo rectángulo de detección.
             self.check_timer.start() 
         else:
-            # El mouse salió completamente del área ampliada.
             self.hide_timer.start() 
-            
         super().leaveEvent(event)
-
 
     def paintEvent(self, event):
         painter = QPainter(self)
@@ -526,17 +619,17 @@ class PopupWindow(QWidget):
         btn_row.addWidget(group_button)
         main_layout.addLayout(btn_row)
 
-        # Área de scroll CON wheelEvent filtrado
+        # Área de scroll
         self.scroll_area = QScrollArea()
         self.scroll_area.setWidgetResizable(True)
         self.scroll_area.setFrameShape(QFrame.Shape.NoFrame)
         self.scroll_area.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
-        self.scroll_area.setFocusPolicy(Qt.FocusPolicy.NoFocus)  # Importante para el scroll
+        self.scroll_area.setFocusPolicy(Qt.FocusPolicy.NoFocus)
         main_layout.addWidget(self.scroll_area)
         
         self.content_widget = QWidget()
         self.content_layout = QVBoxLayout(self.content_widget)
-        self.content_layout.setSpacing(6)  # Más compacto
+        self.content_layout.setSpacing(6)
         self.content_layout.setContentsMargins(0, 0, 0, 0)
         self.content_layout.addStretch()
         self.scroll_area.setWidget(self.content_widget)
@@ -566,10 +659,24 @@ class PopupWindow(QWidget):
                 border: 1px solid rgba(255, 255, 255, 0.08);
                 border-radius: 4px;
             }
+            QWidget#GroupCard {
+                background-color: rgba(100, 150, 255, 0.12);
+                border: 1px solid rgba(100, 150, 255, 0.2);
+                border-radius: 4px;
+            }
             QLabel#lampName {
                 color: #FFFFFF;
                 font-size: 13px;
                 font-weight: 600;
+            }
+            QLabel#groupName {
+                color: #FFFFFF;
+                font-size: 13px;
+                font-weight: 600;
+            }
+            QLabel#lampCount {
+                color: #A0A0A0;
+                font-size: 11px;
             }
             QLabel#controlLabel {
                 color: #E0E0E0;
@@ -623,15 +730,22 @@ class PopupWindow(QWidget):
                 margin: 2px;
             }
         """)
+    
     def load_content(self):
+        """Carga grupos y lámparas no agrupadas"""
         # Limpiar contenido
         for i in reversed(range(self.content_layout.count() - 1)):
             widget = self.content_layout.itemAt(i).widget()
             if widget:
                 widget.deleteLater()
         
-        # Cargar luces individuales
-        for lamp in self.wiz_manager.get_lamps():
+        # Primero cargar los grupos
+        for group_name in self.wiz_manager.get_groups().keys():
+            group_widget = GroupControl(group_name, self.wiz_manager)
+            self.content_layout.insertWidget(self.content_layout.count() - 1, group_widget)
+        
+        # Luego cargar lámparas que NO están en ningún grupo
+        for lamp in self.wiz_manager.get_ungrouped_lamps():
             if 'mac' in lamp and 'ip' in lamp:
                 lamp_widget = LampControl(lamp, self.wiz_manager)
                 self.content_layout.insertWidget(self.content_layout.count() - 1, lamp_widget)
@@ -667,8 +781,6 @@ class PopupWindow(QWidget):
         self.raise_()
         self.activateWindow()
 
-   
-
 class TrayAppQt:
     def __init__(self):
         self.app = QApplication(sys.argv)
@@ -683,23 +795,23 @@ class TrayAppQt:
             print(f"Error: No se pudo cargar el icono desde '{icon_path}'")
             return
         icon = QIcon(icon_pixmap)
-        self.icon = QSystemTrayIcon(icon)  # ✅ Correcto
+        self.icon = QSystemTrayIcon(icon)
         
-        # Crear menú contextual primero
+        # Crear menú contextual
         menu = QMenu()
         show_action = QAction("Mostrar Control", menu)
         exit_action = QAction("Salir", menu)
         menu.addAction(show_action)
         menu.addAction(exit_action)
-        self.icon.setContextMenu(menu)  # ✅ Correcto
+        self.icon.setContextMenu(menu)
         
-        # Mostrar ícono ANTES de crear la ventana
-        self.icon.setVisible(True)  # ✅ Correcto
+        # Mostrar ícono
+        self.icon.setVisible(True)
 
         self.window = PopupWindow(self.wiz_manager)
 
         # Conexiones
-        self.icon.activated.connect(self.handle_icon_click)  # ✅ Correcto
+        self.icon.activated.connect(self.handle_icon_click)
         show_action.triggered.connect(self.show_window)
         exit_action.triggered.connect(self.app.quit)
 
@@ -708,7 +820,6 @@ class TrayAppQt:
             self.show_window()
 
     def show_window(self):
-        # Obtener posición del cursor como fallback
         cursor_pos = QCursor.pos()
         self.window.show_at_position(cursor_pos)
 

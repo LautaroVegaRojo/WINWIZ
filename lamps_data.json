@@ -25,5 +25,10 @@
             "last_temp_kelvin": 2700
         }
     },
-    "groups": {}
+    "groups": {
+        "Pieza": [
+            "d8a01157f514",
+            "d8a01157fbe4"
+        ]
+    }
 }
