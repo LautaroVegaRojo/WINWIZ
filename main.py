@@ -3,26 +3,62 @@ import json
 import socket
 import os
 from PyQt6.QtWidgets import (
-    QApplication, QWidget, QSystemTrayIcon, QMenu, QStyle, QLabel, QVBoxLayout, QPushButton,
-    QHBoxLayout, QSlider, QScrollArea, QFrame, QColorDialog, QCheckBox, QMessageBox, 
-    QGraphicsDropShadowEffect, QLineEdit, QDialog, QListWidget, QListWidgetItem
+    QApplication,
+    QWidget,
+    QSystemTrayIcon,
+    QMenu,
+    QStyle,
+    QLabel,
+    QVBoxLayout,
+    QPushButton,
+    QHBoxLayout,
+    QSlider,
+    QScrollArea,
+    QFrame,
+    QColorDialog,
+    QCheckBox,
+    QMessageBox,
+    QGraphicsDropShadowEffect,
+    QLineEdit,
+    QDialog,
+    QListWidget,
+    QListWidgetItem,
 )
-from PyQt6.QtGui import QAction, QCursor, QColor, QFont, QPainter, QPen, QPainterPath, QIcon, QPixmap
+from PyQt6.QtGui import (
+    QAction,
+    QCursor,
+    QColor,
+    QFont,
+    QPainter,
+    QPen,
+    QPainterPath,
+    QIcon,
+    QPixmap,
+)
 from PyQt6.QtCore import (
-    QPoint, Qt, QThread, pyqtSignal, QPropertyAnimation, QTimer, QRect, QEasingCurve, QRectF
+    QPoint,
+    Qt,
+    QThread,
+    pyqtSignal,
+    QPropertyAnimation,
+    QTimer,
+    QRect,
+    QEasingCurve,
+    QRectF,
 )
 import time
 
 TEMP_MIN = 2200
 TEMP_MAX = 6500
 
+
 class DiscoveryThread(QThread):
     lamp_found = pyqtSignal(dict)
 
     def run(self):
         UDP_PORT = 38899
-        BROADCAST_IP = '255.255.255.255'
-        DISCOVERY_MESSAGE = '{"method":"getSystemConfig","params":{}}'.encode('utf-8')
+        BROADCAST_IP = "255.255.255.255"
+        DISCOVERY_MESSAGE = '{"method":"getSystemConfig","params":{}}'.encode("utf-8")
 
         sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
         sock.setsockopt(socket.SOL_SOCKET, socket.SO_BROADCAST, 1)
@@ -38,26 +74,27 @@ class DiscoveryThread(QThread):
                 try:
                     data, addr = sock.recvfrom(1024)
                     try:
-                        response = json.loads(data.decode('utf-8'))
+                        response = json.loads(data.decode("utf-8"))
                     except json.JSONDecodeError:
                         continue
-                    mac = response.get('result', {}).get('mac')
+                    mac = response.get("result", {}).get("mac")
                     ip = addr[0]
 
                     if mac and ip and mac not in discovered_macs:
                         discovered_macs.add(mac)
-                        cleaned_mac = mac.replace(':', '')
+                        cleaned_mac = mac.replace(":", "")
                         name = f"WiZ-{cleaned_mac[-6:]}"
-                        self.lamp_found.emit({'ip': ip, 'mac': mac, 'name': name})
+                        self.lamp_found.emit({"ip": ip, "mac": mac, "name": name})
                 except socket.timeout:
                     pass
                 except Exception:
                     continue
         finally:
             sock.close()
-            
+
+
 class WizManager:
-    DATA_FILE = 'lamps_data.json'
+    DATA_FILE = "lamps_data.json"
 
     def __init__(self):
         self.lamps = {}
@@ -66,18 +103,18 @@ class WizManager:
 
     def load_data(self):
         if os.path.exists(self.DATA_FILE):
-            with open(self.DATA_FILE, 'r') as f:
+            with open(self.DATA_FILE, "r") as f:
                 try:
                     data = json.load(f)
-                    self.lamps = data.get('lamps', {})
-                    self.groups = data.get('groups', {})
+                    self.lamps = data.get("lamps", {})
+                    self.groups = data.get("groups", {})
                 except json.JSONDecodeError:
                     self.lamps = {}
                     self.groups = {}
 
     def save_data(self):
-        with open(self.DATA_FILE, 'w') as f:
-            json.dump({'lamps': self.lamps, 'groups': self.groups}, f, indent=4)
+        with open(self.DATA_FILE, "w") as f:
+            json.dump({"lamps": self.lamps, "groups": self.groups}, f, indent=4)
 
     def add_lamp(self, mac, ip, name):
         if mac not in self.lamps:
@@ -91,6 +128,12 @@ class WizManager:
             }
             self.save_data()
             return True
+        else:
+            # Si la lámpara ya existe, actualizar la IP si cambió
+            if self.lamps[mac]['ip'] != ip:
+                self.lamps[mac]['ip'] = ip
+                self.save_data()
+                return True  # Retornar True para refrescar la interfaz
         return False
 
     def add_group(self, group_name, lamp_macs):
@@ -103,7 +146,7 @@ class WizManager:
     def get_lamps_in_group(self, group_name):
         lamp_macs = self.groups.get(group_name, [])
         return [self.lamps[mac] for mac in lamp_macs if mac in self.lamps]
-    
+
     def get_lamp_groups(self, mac):
         """Retorna lista de nombres de grupos que contienen esta lámpara"""
         groups = []
@@ -112,61 +155,64 @@ class WizManager:
                 groups.append(group_name)
         return groups
 
-    def update_lamp_state(self, mac, brightness=None, color_hex=None, last_temp_kelvin=None):
+    def update_lamp_state(
+        self, mac, brightness=None, color_hex=None, last_temp_kelvin=None
+    ):
         if mac in self.lamps:
             if brightness is not None:
-                self.lamps[mac]['last_brightness'] = brightness
+                self.lamps[mac]["last_brightness"] = brightness
             if color_hex is not None:
-                self.lamps[mac]['last_color_hex'] = color_hex
+                self.lamps[mac]["last_color_hex"] = color_hex
             if last_temp_kelvin is not None:
-                self.lamps[mac]['last_temp_kelvin'] = last_temp_kelvin
+                self.lamps[mac]["last_temp_kelvin"] = last_temp_kelvin
             self.save_data()
 
     def get_lamps(self):
         return list(self.lamps.values())
-    
+
     def get_ungrouped_lamps(self):
         """Retorna lámparas que no pertenecen a ningún grupo"""
         grouped_macs = set()
         for lamp_macs in self.groups.values():
             grouped_macs.update(lamp_macs)
-        
-        return [lamp for lamp in self.lamps.values() if lamp['mac'] not in grouped_macs]
+
+        return [lamp for lamp in self.lamps.values() if lamp["mac"] not in grouped_macs]
 
     def send_command(self, ip, command_params):
         try:
             sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
             sock.settimeout(0.05)
-            command_json = json.dumps(command_params).encode('utf-8')
+            command_json = json.dumps(command_params).encode("utf-8")
             sock.sendto(command_json, (ip, 38899))
             sock.close()
         except Exception:
             pass
-    
+
     def send_command_to_group(self, group_name, command_params):
         """Envía un comando a todas las lámparas de un grupo"""
         lamps = self.get_lamps_in_group(group_name)
         for lamp in lamps:
-            self.send_command(lamp['ip'], command_params)
+            self.send_command(lamp["ip"], command_params)
+
 
 class ImprovedSlider(QSlider):
     """Slider mejorado que sigue al mouse incluso fuera del área"""
-    
+
     valueChangedDelayed = pyqtSignal(int)  # Nueva señal con delay
-    
+
     def __init__(self, orientation, parent=None):
         super().__init__(orientation, parent)
         self._is_dragging = False
-        
+
         # Timer para retrasar el envío de comandos
         self._update_timer = QTimer(self)
         self._update_timer.setSingleShot(True)
         self._update_timer.setInterval(50)  # 50ms de delay
         self._update_timer.timeout.connect(self._emit_delayed_value)
-        
+
         # Conectar el valueChanged original al timer
         self.valueChanged.connect(self._on_value_changed)
-        
+
     def _on_value_changed(self, value):
         """Se llama cada vez que cambia el valor"""
         # Si estamos arrastrando, reiniciar el timer
@@ -175,11 +221,11 @@ class ImprovedSlider(QSlider):
         else:
             # Si no estamos arrastrando (click directo), emitir inmediatamente
             self.valueChangedDelayed.emit(value)
-    
+
     def _emit_delayed_value(self):
         """Emite el valor después del delay"""
         self.valueChangedDelayed.emit(self.value())
-        
+
     def mousePressEvent(self, event):
         if event.button() == Qt.MouseButton.LeftButton:
             self._is_dragging = True
@@ -188,14 +234,14 @@ class ImprovedSlider(QSlider):
             event.accept()
         else:
             super().mousePressEvent(event)
-    
+
     def mouseMoveEvent(self, event):
         if self._is_dragging:
             self._update_value_from_position(event.pos())
             event.accept()
         else:
             super().mouseMoveEvent(event)
-    
+
     def mouseReleaseEvent(self, event):
         if event.button() == Qt.MouseButton.LeftButton:
             self._is_dragging = False
@@ -205,7 +251,7 @@ class ImprovedSlider(QSlider):
             event.accept()
         else:
             super().mouseReleaseEvent(event)
-    
+
     def _update_value_from_position(self, pos):
         """Calcula el valor del slider según la posición del mouse"""
         if self.orientation() == Qt.Orientation.Horizontal:
@@ -218,65 +264,73 @@ class ImprovedSlider(QSlider):
             groove_height = self.height()
             position = max(0, min(pos.y(), groove_height))
             percentage = 1.0 - (position / groove_height)  # Invertido para vertical
-        
+
         # Convertir el porcentaje al rango del slider
         value_range = self.maximum() - self.minimum()
         new_value = int(self.minimum() + (percentage * value_range))
-        
+
         # Establecer el valor
         self.setValue(new_value)
 
+
 class ModernToggle(QWidget):
     stateChanged = pyqtSignal(int)
-    
+
     def __init__(self, parent=None):
         super().__init__(parent)
         self.setFixedSize(40, 20)
         self._checked = False
         self.setCursor(Qt.CursorShape.PointingHandCursor)
-        
+
     def mousePressEvent(self, event):
         if event.button() == Qt.MouseButton.LeftButton:
             self._checked = not self._checked
             self.update()
-            self.stateChanged.emit(Qt.CheckState.Checked.value if self._checked else Qt.CheckState.Unchecked.value)
+            self.stateChanged.emit(
+                Qt.CheckState.Checked.value
+                if self._checked
+                else Qt.CheckState.Unchecked.value
+            )
             event.accept()
-        
+
     def isChecked(self):
         return self._checked
-    
+
     def setChecked(self, checked):
         if self._checked != checked:
             self._checked = checked
             self.update()
-        
+
     def paintEvent(self, event):
         painter = QPainter(self)
         painter.setRenderHint(QPainter.RenderHint.Antialiasing)
-        
+
         bg_color = QColor("#005FB8") if self._checked else QColor("#5C5C5C")
         circle_x = 22 if self._checked else 2
-        
+
         painter.setPen(Qt.PenStyle.NoPen)
         painter.setBrush(bg_color)
         painter.drawRoundedRect(0, 0, 40, 20, 10, 10)
-        
+
         painter.setBrush(QColor("#FFFFFF"))
         painter.drawEllipse(circle_x, 2, 16, 16)
+
 
 class LampControl(QWidget):
     def __init__(self, lamp_data, wiz_manager, parent=None):
         super().__init__(parent)
-        self.mac = lamp_data['mac']
-        self.ip = lamp_data['ip']
+        self.mac = lamp_data["mac"]
+        self.ip = lamp_data["ip"]
         self.wiz_manager = wiz_manager
-        
-        initial_brightness = lamp_data.get('last_brightness', 100)
-        self.is_on = (initial_brightness > 0)
-        self.current_color = QColor(lamp_data.get('last_color_hex', '#ffffff')) 
-        self.current_temp = lamp_data.get('last_temp_kelvin', 2700)
-        self.current_hue = self.current_color.hue() if self.current_color.hue() >= 0 else 0
-        
+
+        initial_brightness = lamp_data.get("last_brightness", 100)
+        self.is_on = initial_brightness > 0
+        self.current_color = QColor(lamp_data.get("last_color_hex", "#ffffff"))
+        self.current_temp = lamp_data.get("last_temp_kelvin", 2700)
+        self.current_hue = (
+            self.current_color.hue() if self.current_color.hue() >= 0 else 0
+        )
+
         self.setObjectName("LampCard")
         self.setup_ui(lamp_data, initial_brightness)
 
@@ -291,79 +345,80 @@ class LampControl(QWidget):
         header_layout = QHBoxLayout(header)
         header_layout.setContentsMargins(0, 0, 0, 0)
         header_layout.setSpacing(8)
-        
-        name_label = QLabel(lamp_data['name'])
+
+        name_label = QLabel(lamp_data["name"])
         name_label.setObjectName("lampName")
         header_layout.addWidget(name_label)
         header_layout.addStretch()
-        
+
         self.toggle = ModernToggle()
         self.toggle.setChecked(self.is_on)
         self.toggle.stateChanged.connect(self.send_toggle_command)
         header_layout.addWidget(self.toggle)
-        
+
         def header_click(e):
             if e.button() == Qt.MouseButton.LeftButton:
                 self.toggle.mousePressEvent(e)
+
         header.mousePressEvent = header_click
-        
+
         main_layout.addWidget(header)
-        
+
         # Brillo compacto
         brightness_layout = QHBoxLayout()
         brightness_layout.setSpacing(8)
-        
+
         bright_label = QLabel("☀")
         bright_label.setFixedWidth(16)
         bright_label.setStyleSheet("font-size: 12px; color: #E0E0E0;")
         brightness_layout.addWidget(bright_label)
-        
+
         self.brightness_slider = ImprovedSlider(Qt.Orientation.Horizontal)
         self.brightness_slider.setRange(10, 100)
         self.brightness_slider.setValue(initial_brightness)
         self.brightness_slider.valueChangedDelayed.connect(self.send_brightness_command)
         self.brightness_slider.valueChanged.connect(self.update_brightness_label)
         brightness_layout.addWidget(self.brightness_slider)
-        
+
         self.brightness_value = QLabel(f"{initial_brightness}%")
         self.brightness_value.setObjectName("valueLabel")
         self.brightness_value.setFixedWidth(35)
         brightness_layout.addWidget(self.brightness_value)
-        
+
         main_layout.addLayout(brightness_layout)
-        
+
         # Temperatura compacta
         temp_layout = QHBoxLayout()
         temp_layout.setSpacing(8)
-        
+
         temp_label = QLabel("◐")
         temp_label.setFixedWidth(16)
         temp_label.setStyleSheet("font-size: 12px; color: #E0E0E0;")
         temp_layout.addWidget(temp_label)
-        
+
         self.temp_slider = ImprovedSlider(Qt.Orientation.Horizontal)
         self.temp_slider.setRange(0, 100)
         self.temp_slider.setValue(self.kelvin_to_slider(self.current_temp))
         self.temp_slider.valueChangedDelayed.connect(self.send_temp_command)
         self.temp_slider.valueChanged.connect(self.update_temp_label)
         temp_layout.addWidget(self.temp_slider)
-        
+
         self.temp_value = QLabel(f"{self.current_temp}K")
         self.temp_value.setObjectName("valueLabel")
         self.temp_value.setFixedWidth(35)
         temp_layout.addWidget(self.temp_value)
-        
+
         main_layout.addLayout(temp_layout)
-        
+
         # Color como slider de HUE
         color_layout = QHBoxLayout()
         color_layout.setSpacing(8)
-        
+
         color_label = QLabel("●")
         color_label.setFixedWidth(16)
         color_label.setStyleSheet("font-size: 12px; color: #E0E0E0;")
         color_layout.addWidget(color_label)
-        
+
         self.color_slider = ImprovedSlider(Qt.Orientation.Horizontal)
         self.color_slider.setRange(0, 359)
         self.color_slider.setValue(self.current_hue)
@@ -371,23 +426,25 @@ class LampControl(QWidget):
         self.color_slider.valueChangedDelayed.connect(self.send_color_command)
         self.color_slider.valueChanged.connect(self.update_color_preview_only)
         color_layout.addWidget(self.color_slider)
-        
+
         self.color_preview = QLabel()
         self.color_preview.setFixedSize(35, 20)
         self.update_color_preview()
         color_layout.addWidget(self.color_preview)
-        
+
         main_layout.addLayout(color_layout)
 
     def update_color_preview(self):
         color = QColor.fromHsv(self.current_hue, 255, 255)
-        self.color_preview.setStyleSheet(f"""
+        self.color_preview.setStyleSheet(
+            f"""
             QLabel {{
                 background-color: {color.name()};
                 border: 1px solid rgba(255,255,255,0.2);
                 border-radius: 4px;
             }}
-        """)
+        """
+        )
 
     def kelvin_to_slider(self, kelvin):
         return int(((kelvin - TEMP_MIN) / (TEMP_MAX - TEMP_MIN)) * 100)
@@ -398,23 +455,25 @@ class LampControl(QWidget):
     def update_brightness_label(self, value):
         """Actualiza solo el label sin enviar comando"""
         self.brightness_value.setText(f"{value}%")
-    
+
     def update_temp_label(self, slider_val):
         """Actualiza solo el label sin enviar comando"""
         kelvin = self.slider_to_kelvin(slider_val)
         self.temp_value.setText(f"{kelvin}K")
-    
+
     def update_color_preview_only(self, hue):
         """Actualiza solo el preview sin enviar comando"""
         self.current_hue = hue
         color = QColor.fromHsv(hue, 255, 255)
-        self.color_preview.setStyleSheet(f"""
+        self.color_preview.setStyleSheet(
+            f"""
             QLabel {{
                 background-color: {color.name()};
                 border: 1px solid rgba(255,255,255,0.2);
                 border-radius: 4px;
             }}
-        """)
+        """
+        )
 
     def send_toggle_command(self, state):
         is_on = state == Qt.CheckState.Checked.value
@@ -429,7 +488,7 @@ class LampControl(QWidget):
             self.toggle.setChecked(True)
         command = {"method": "setPilot", "params": {"dimming": value, "state": True}}
         self.wiz_manager.send_command(self.ip, command)
-        
+
     def send_temp_command(self, slider_val):
         kelvin = self.slider_to_kelvin(slider_val)
         self.current_temp = kelvin
@@ -438,7 +497,12 @@ class LampControl(QWidget):
             self.toggle.setChecked(True)
         command = {
             "method": "setPilot",
-            "params": {"temp": int(kelvin), "dimming": self.brightness_slider.value(), "state": True, "colorMode": "temp"}
+            "params": {
+                "temp": int(kelvin),
+                "dimming": self.brightness_slider.value(),
+                "state": True,
+                "colorMode": "temp",
+            },
         }
         self.wiz_manager.send_command(self.ip, command)
 
@@ -446,145 +510,154 @@ class LampControl(QWidget):
         self.current_hue = hue
         color = QColor.fromHsv(hue, 255, 255)
         self.current_color = color
-        
+
         self.wiz_manager.update_lamp_state(self.mac, color_hex=color.name())
         if not self.is_on:
             self.toggle.setChecked(True)
-        
+
         r, g, b = color.red(), color.green(), color.blue()
         dimming = self.brightness_slider.value()
         command = {
             "method": "setPilot",
-            "params": {"r": int(r), "g": int(g), "b": int(b), "dimming": int(dimming), "state": True, "colorMode": "rgb"}
+            "params": {
+                "r": int(r),
+                "g": int(g),
+                "b": int(b),
+                "dimming": int(dimming),
+                "state": True,
+                "colorMode": "rgb",
+            },
         }
         self.wiz_manager.send_command(self.ip, command)
 
+
 class GroupControl(QWidget):
     """Control para un grupo de lámparas con expansión/colapso y controles completos"""
-    
+
     def __init__(self, group_name, wiz_manager, parent=None):
         super().__init__(parent)
         self.group_name = group_name
         self.wiz_manager = wiz_manager
         self.is_expanded = False
         self.lamp_widgets = []
-        
+
         # Estado inicial del grupo
         self.is_on = True
         self.current_brightness = 100
         self.current_temp = 2700
         self.current_hue = 0
         self.current_color = QColor.fromHsv(0, 255, 255)
-        
+
         self.setObjectName("GroupCard")
         self.setup_ui()
-    
+
     def setup_ui(self):
         main_layout = QVBoxLayout(self)
         main_layout.setContentsMargins(12, 10, 12, 10)
         main_layout.setSpacing(8)
-        
+
         # Header con flecha expandible
         header = QWidget()
         header_layout = QHBoxLayout(header)
         header_layout.setContentsMargins(0, 0, 0, 0)
         header_layout.setSpacing(8)
-        
+
         # Flecha de expansión (solo la flecha es clickeable)
         arrow_container = QWidget()
         arrow_container.setCursor(Qt.CursorShape.PointingHandCursor)
         arrow_layout = QHBoxLayout(arrow_container)
         arrow_layout.setContentsMargins(0, 0, 0, 0)
-        
+
         self.arrow_label = QLabel("▶")
         self.arrow_label.setFixedWidth(16)
         self.arrow_label.setStyleSheet("font-size: 10px; color: #E0E0E0;")
         arrow_layout.addWidget(self.arrow_label)
-        
+
         def arrow_click(e):
             if e.button() == Qt.MouseButton.LeftButton:
                 self.toggle_expansion()
+
         arrow_container.mousePressEvent = arrow_click
-        
+
         header_layout.addWidget(arrow_container)
-        
+
         # Nombre del grupo
         name_label = QLabel(f"🗂 {self.group_name}")
         name_label.setObjectName("groupName")
         header_layout.addWidget(name_label)
-        
+
         # Contador de lámparas
         lamp_count = len(self.wiz_manager.get_lamps_in_group(self.group_name))
         count_label = QLabel(f"({lamp_count})")
         count_label.setObjectName("lampCount")
         header_layout.addWidget(count_label)
-        
+
         header_layout.addStretch()
-        
+
         # Toggle para todo el grupo
         self.toggle = ModernToggle()
         self.toggle.setChecked(self.is_on)
         self.toggle.stateChanged.connect(self.send_toggle_command)
         header_layout.addWidget(self.toggle)
-        
+
         main_layout.addWidget(header)
-        
+
         # Controles del grupo (como una lámpara)
         # Brillo
         brightness_layout = QHBoxLayout()
         brightness_layout.setSpacing(8)
-        
+
         bright_label = QLabel("☀")
         bright_label.setFixedWidth(16)
         bright_label.setStyleSheet("font-size: 12px; color: #E0E0E0;")
         brightness_layout.addWidget(bright_label)
-        
+
         self.brightness_slider = ImprovedSlider(Qt.Orientation.Horizontal)
         self.brightness_slider.setRange(10, 100)
         self.brightness_slider.setValue(self.current_brightness)
         self.brightness_slider.valueChangedDelayed.connect(self.send_brightness_command)
         self.brightness_slider.valueChanged.connect(self.update_brightness_label)
         brightness_layout.addWidget(self.brightness_slider)
-        
+
         self.brightness_value = QLabel(f"{self.current_brightness}%")
         self.brightness_value.setObjectName("valueLabel")
         self.brightness_value.setFixedWidth(35)
         brightness_layout.addWidget(self.brightness_value)
-        
+
         main_layout.addLayout(brightness_layout)
-        
+
         # Temperatura
         temp_layout = QHBoxLayout()
         temp_layout.setSpacing(8)
-        
+
         temp_label = QLabel("◐")
         temp_label.setFixedWidth(16)
         temp_label.setStyleSheet("font-size: 12px; color: #E0E0E0;")
         temp_layout.addWidget(temp_label)
-        
+
         self.temp_slider = ImprovedSlider(Qt.Orientation.Horizontal)
         self.temp_slider.setRange(0, 100)
         self.temp_slider.setValue(self.kelvin_to_slider(self.current_temp))
         self.temp_slider.valueChangedDelayed.connect(self.send_temp_command)
         self.temp_slider.valueChanged.connect(self.update_temp_label)
         temp_layout.addWidget(self.temp_slider)
-        
+
         self.temp_value = QLabel(f"{self.current_temp}K")
         self.temp_value.setObjectName("valueLabel")
         self.temp_value.setFixedWidth(35)
         temp_layout.addWidget(self.temp_value)
-        
+
         main_layout.addLayout(temp_layout)
-        
+
         # Color
         color_layout = QHBoxLayout()
         color_layout.setSpacing(8)
-        
+
         color_label = QLabel("●")
         color_label.setFixedWidth(16)
         color_label.setStyleSheet("font-size: 12px; color: #E0E0E0;")
         color_layout.addWidget(color_label)
-        
+
         self.color_slider = ImprovedSlider(Qt.Orientation.Horizontal)
         self.color_slider.setRange(0, 359)
         self.color_slider.setValue(self.current_hue)
@@ -592,62 +665,66 @@ class GroupControl(QWidget):
         self.color_slider.valueChangedDelayed.connect(self.send_color_command)
         self.color_slider.valueChanged.connect(self.update_color_preview_only)
         color_layout.addWidget(self.color_slider)
-        
+
         self.color_preview = QLabel()
         self.color_preview.setFixedSize(35, 20)
         self.update_color_preview()
         color_layout.addWidget(self.color_preview)
-        
+
         main_layout.addLayout(color_layout)
-        
+
         # Contenedor de lámparas individuales (inicialmente oculto)
         self.lamps_container = QWidget()
         self.lamps_layout = QVBoxLayout(self.lamps_container)
         self.lamps_layout.setContentsMargins(20, 8, 0, 0)  # Indentación
         self.lamps_layout.setSpacing(6)
         self.lamps_container.hide()
-        
+
         main_layout.addWidget(self.lamps_container)
-        
+
         # Crear controles de las lámparas individuales
         self.create_lamp_controls()
-    
+
     def kelvin_to_slider(self, kelvin):
         return int(((kelvin - TEMP_MIN) / (TEMP_MAX - TEMP_MIN)) * 100)
 
     def slider_to_kelvin(self, slider_val):
         return int(((slider_val / 100) * (TEMP_MAX - TEMP_MIN)) + TEMP_MIN)
-    
+
     def update_brightness_label(self, value):
         """Actualiza solo el label sin enviar comando"""
         self.brightness_value.setText(f"{value}%")
-    
+
     def update_temp_label(self, slider_val):
         """Actualiza solo el label sin enviar comando"""
         kelvin = self.slider_to_kelvin(slider_val)
         self.temp_value.setText(f"{kelvin}K")
-    
+
     def update_color_preview_only(self, hue):
         """Actualiza solo el preview sin enviar comando"""
         color = QColor.fromHsv(hue, 255, 255)
-        self.color_preview.setStyleSheet(f"""
+        self.color_preview.setStyleSheet(
+            f"""
             QLabel {{
                 background-color: {color.name()};
                 border: 1px solid rgba(255,255,255,0.2);
                 border-radius: 4px;
             }}
-        """)
-    
+        """
+        )
+
     def update_color_preview(self):
         color = QColor.fromHsv(self.current_hue, 255, 255)
-        self.color_preview.setStyleSheet(f"""
+        self.color_preview.setStyleSheet(
+            f"""
             QLabel {{
                 background-color: {color.name()};
                 border: 1px solid rgba(255,255,255,0.2);
                 border-radius: 4px;
             }}
-        """)
-    
+        """
+        )
+
     def create_lamp_controls(self):
         """Crea los controles para cada lámpara del grupo"""
         lamps = self.wiz_manager.get_lamps_in_group(self.group_name)
@@ -655,18 +732,18 @@ class GroupControl(QWidget):
             lamp_widget = LampControl(lamp, self.wiz_manager)
             self.lamps_layout.addWidget(lamp_widget)
             self.lamp_widgets.append(lamp_widget)
-    
+
     def toggle_expansion(self):
         """Alterna entre expandido y colapsado"""
         self.is_expanded = not self.is_expanded
-        
+
         if self.is_expanded:
             self.arrow_label.setText("▼")
             self.lamps_container.show()
         else:
             self.arrow_label.setText("▶")
             self.lamps_container.hide()
-    
+
     def send_toggle_command(self, state):
         """Envía comando de encendido/apagado a todas las lámparas del grupo"""
         is_on = state == Qt.CheckState.Checked.value
@@ -674,44 +751,49 @@ class GroupControl(QWidget):
         dimming = self.brightness_slider.value() if is_on else 100
         command = {"method": "setPilot", "params": {"state": is_on, "dimming": dimming}}
         self.wiz_manager.send_command_to_group(self.group_name, command)
-        
+
         # Actualizar toggles de las lámparas individuales
         for lamp_widget in self.lamp_widgets:
             lamp_widget.toggle.setChecked(is_on)
-    
+
     def send_brightness_command(self, value):
         """Envía comando de brillo a todas las lámparas del grupo"""
         self.current_brightness = value
         self.brightness_value.setText(f"{value}%")
-        
+
         if not self.is_on:
             self.toggle.setChecked(True)
-        
+
         command = {"method": "setPilot", "params": {"dimming": value, "state": True}}
         self.wiz_manager.send_command_to_group(self.group_name, command)
-        
+
         # Actualizar sliders de las lámparas individuales
         for lamp_widget in self.lamp_widgets:
             lamp_widget.brightness_slider.blockSignals(True)
             lamp_widget.brightness_slider.setValue(value)
             lamp_widget.brightness_value.setText(f"{value}%")
             lamp_widget.brightness_slider.blockSignals(False)
-    
+
     def send_temp_command(self, slider_val):
         """Envía comando de temperatura a todas las lámparas del grupo"""
         kelvin = self.slider_to_kelvin(slider_val)
         self.current_temp = kelvin
         self.temp_value.setText(f"{kelvin}K")
-        
+
         if not self.is_on:
             self.toggle.setChecked(True)
-        
+
         command = {
             "method": "setPilot",
-            "params": {"temp": int(kelvin), "dimming": self.brightness_slider.value(), "state": True, "colorMode": "temp"}
+            "params": {
+                "temp": int(kelvin),
+                "dimming": self.brightness_slider.value(),
+                "state": True,
+                "colorMode": "temp",
+            },
         }
         self.wiz_manager.send_command_to_group(self.group_name, command)
-        
+
         # Actualizar sliders de las lámparas individuales
         for lamp_widget in self.lamp_widgets:
             lamp_widget.temp_slider.blockSignals(True)
@@ -719,25 +801,32 @@ class GroupControl(QWidget):
             lamp_widget.temp_value.setText(f"{kelvin}K")
             lamp_widget.current_temp = kelvin
             lamp_widget.temp_slider.blockSignals(False)
-    
+
     def send_color_command(self, hue):
         """Envía comando de color a todas las lámparas del grupo"""
         self.current_hue = hue
         color = QColor.fromHsv(hue, 255, 255)
         self.current_color = color
         self.update_color_preview()
-        
+
         if not self.is_on:
             self.toggle.setChecked(True)
-        
+
         r, g, b = color.red(), color.green(), color.blue()
         dimming = self.brightness_slider.value()
         command = {
             "method": "setPilot",
-            "params": {"r": int(r), "g": int(g), "b": int(b), "dimming": int(dimming), "state": True, "colorMode": "rgb"}
+            "params": {
+                "r": int(r),
+                "g": int(g),
+                "b": int(b),
+                "dimming": int(dimming),
+                "state": True,
+                "colorMode": "rgb",
+            },
         }
         self.wiz_manager.send_command_to_group(self.group_name, command)
-        
+
         # Actualizar sliders de las lámparas individuales
         for lamp_widget in self.lamp_widgets:
             lamp_widget.color_slider.blockSignals(True)
@@ -747,6 +836,7 @@ class GroupControl(QWidget):
             lamp_widget.update_color_preview()
             lamp_widget.color_slider.blockSignals(False)
 
+
 class GroupDialog(QDialog):
     def __init__(self, wiz_manager, parent=None):
         super().__init__(parent)
@@ -754,22 +844,22 @@ class GroupDialog(QDialog):
         self.setWindowTitle("Crear Grupo")
         self.setModal(True)
         self.resize(300, 400)
-        
+
         layout = QVBoxLayout(self)
-        
+
         layout.addWidget(QLabel("Nombre del grupo:"))
         self.group_name_input = QLineEdit()
         layout.addWidget(self.group_name_input)
-        
+
         layout.addWidget(QLabel("Seleccionar luces:"))
         self.lamp_list = QListWidget()
         for lamp in self.wiz_manager.get_lamps():
-            item = QListWidgetItem(lamp['name'])
-            item.setData(Qt.ItemDataRole.UserRole, lamp['mac'])
+            item = QListWidgetItem(lamp["name"])
+            item.setData(Qt.ItemDataRole.UserRole, lamp["mac"])
             item.setCheckState(Qt.CheckState.Unchecked)
             self.lamp_list.addItem(item)
         layout.addWidget(self.lamp_list)
-        
+
         btn_layout = QHBoxLayout()
         save_btn = QPushButton("Guardar")
         cancel_btn = QPushButton("Cancelar")
@@ -778,53 +868,58 @@ class GroupDialog(QDialog):
         btn_layout.addWidget(save_btn)
         btn_layout.addWidget(cancel_btn)
         layout.addLayout(btn_layout)
-    
+
     def save_group(self):
         group_name = self.group_name_input.text().strip()
         if not group_name:
             QMessageBox.warning(self, "Error", "Ingresa un nombre para el grupo")
             return
-        
+
         selected_macs = []
         for i in range(self.lamp_list.count()):
             item = self.lamp_list.item(i)
             if item.checkState() == Qt.CheckState.Checked:
                 selected_macs.append(item.data(Qt.ItemDataRole.UserRole))
-        
+
         if not selected_macs:
             QMessageBox.warning(self, "Error", "Selecciona al menos una luz")
             return
-        
+
         self.wiz_manager.add_group(group_name, selected_macs)
         self.accept()
+
 
 class PopupWindow(QWidget):
     def __init__(self, wiz_manager):
         super().__init__()
         self.wiz_manager = wiz_manager
-        
+
         self.animation = QPropertyAnimation(self, b"windowOpacity")
         self.animation.setDuration(250)
         self.animation.setEasingCurve(QEasingCurve.Type.InOutQuad)
         self.animation.finished.connect(super().hide)
-        
+
         self.hide_timer = QTimer(self)
         self.hide_timer.setInterval(400)
         self.hide_timer.setSingleShot(True)
-        self.hide_timer.timeout.connect(self.start_hide_animation) 
-        
+        self.hide_timer.timeout.connect(self.start_hide_animation)
+
         self.check_timer = QTimer(self)
         self.check_timer.setInterval(100)
-        self.check_timer.timeout.connect(self.check_hover_area) 
+        self.check_timer.timeout.connect(self.check_hover_area)
 
         self.setWindowTitle("WiZ Control")
-        self.setWindowFlags(Qt.WindowType.Tool | Qt.WindowType.FramelessWindowHint | Qt.WindowType.WindowStaysOnTopHint)
+        self.setWindowFlags(
+            Qt.WindowType.Tool
+            | Qt.WindowType.FramelessWindowHint
+            | Qt.WindowType.WindowStaysOnTopHint
+        )
         self.setAttribute(Qt.WidgetAttribute.WA_TranslucentBackground)
-        self.setGeometry(0, 0, 340, 450) 
-        
+        self.setGeometry(0, 0, 340, 450)
+
         self.setup_ui()
         self.load_content()
-        
+
     def start_hide_animation(self):
         self.animation.stop()
         self.animation.setStartValue(self.windowOpacity())
@@ -833,12 +928,12 @@ class PopupWindow(QWidget):
 
     def show(self):
         self.setWindowOpacity(1.0)
-        if hasattr(self, 'check_timer') and self.check_timer.isActive():
+        if hasattr(self, "check_timer") and self.check_timer.isActive():
             self.check_timer.stop()
         super().show()
-        
+
     def hide(self):
-        pass 
+        pass
 
     def get_detection_rect(self) -> QRect:
         win_rect = self.frameGeometry()
@@ -853,36 +948,36 @@ class PopupWindow(QWidget):
         if not detection_rect.contains(cursor_pos):
             self.check_timer.stop()
             self.hide_timer.start()
-            
+
     def enterEvent(self, event):
         self.hide_timer.stop()
-        if hasattr(self, 'check_timer') and self.check_timer.isActive():
+        if hasattr(self, "check_timer") and self.check_timer.isActive():
             self.check_timer.stop()
         self.animation.stop()
-        self.setWindowOpacity(1.0) 
+        self.setWindowOpacity(1.0)
         super().enterEvent(event)
 
     def leaveEvent(self, event):
         detection_rect = self.get_detection_rect()
         cursor_pos = QCursor.pos()
-        
+
         if detection_rect.contains(cursor_pos):
             self.hide_timer.stop()
-            self.check_timer.start() 
+            self.check_timer.start()
         else:
-            self.hide_timer.start() 
+            self.hide_timer.start()
         super().leaveEvent(event)
 
     def paintEvent(self, event):
         painter = QPainter(self)
         painter.setRenderHint(QPainter.RenderHint.Antialiasing)
-        
+
         path = QPainterPath()
         path.addRoundedRect(QRectF(self.rect()), 8, 8)
-        
+
         painter.setClipPath(path)
         painter.fillRect(self.rect(), QColor(32, 32, 32, 240))
-        
+
         painter.setPen(QPen(QColor(255, 255, 255, 20), 1))
         painter.drawRoundedRect(self.rect().adjusted(0, 0, -1, -1), 8, 8)
 
@@ -897,12 +992,12 @@ class PopupWindow(QWidget):
         self.discover_button.setObjectName("discoverButton")
         self.discover_button.setFixedHeight(32)
         self.discover_button.clicked.connect(self.start_discovery)
-        
+
         group_button = QPushButton("Crear Grupo")
         group_button.setObjectName("groupButton")
         group_button.setFixedHeight(32)
         group_button.clicked.connect(self.create_group)
-        
+
         btn_row.addWidget(self.discover_button)
         btn_row.addWidget(group_button)
         main_layout.addLayout(btn_row)
@@ -911,10 +1006,12 @@ class PopupWindow(QWidget):
         self.scroll_area = QScrollArea()
         self.scroll_area.setWidgetResizable(True)
         self.scroll_area.setFrameShape(QFrame.Shape.NoFrame)
-        self.scroll_area.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
+        self.scroll_area.setHorizontalScrollBarPolicy(
+            Qt.ScrollBarPolicy.ScrollBarAlwaysOff
+        )
         self.scroll_area.setFocusPolicy(Qt.FocusPolicy.NoFocus)
         main_layout.addWidget(self.scroll_area)
-        
+
         self.content_widget = QWidget()
         self.content_layout = QVBoxLayout(self.content_widget)
         self.content_layout.setSpacing(6)
@@ -925,7 +1022,8 @@ class PopupWindow(QWidget):
         self.apply_styles()
 
     def apply_styles(self):
-        self.setStyleSheet("""
+        self.setStyleSheet(
+            """
             QWidget {
                 background-color: transparent;
                 color: #FFFFFF;
@@ -1017,8 +1115,9 @@ class PopupWindow(QWidget):
                 border-radius: 5px;
                 margin: 2px;
             }
-        """)
-    
+        """
+        )
+
     def load_content(self):
         """Carga grupos y lámparas no agrupadas"""
         # Limpiar contenido
@@ -1026,17 +1125,21 @@ class PopupWindow(QWidget):
             widget = self.content_layout.itemAt(i).widget()
             if widget:
                 widget.deleteLater()
-        
+
         # Primero cargar los grupos
         for group_name in self.wiz_manager.get_groups().keys():
             group_widget = GroupControl(group_name, self.wiz_manager)
-            self.content_layout.insertWidget(self.content_layout.count() - 1, group_widget)
-        
+            self.content_layout.insertWidget(
+                self.content_layout.count() - 1, group_widget
+            )
+
         # Luego cargar lámparas que NO están en ningún grupo
         for lamp in self.wiz_manager.get_ungrouped_lamps():
-            if 'mac' in lamp and 'ip' in lamp:
+            if "mac" in lamp and "ip" in lamp:
                 lamp_widget = LampControl(lamp, self.wiz_manager)
-                self.content_layout.insertWidget(self.content_layout.count() - 1, lamp_widget)
+                self.content_layout.insertWidget(
+                    self.content_layout.count() - 1, lamp_widget
+                )
 
     def create_group(self):
         dialog = GroupDialog(self.wiz_manager, self)
@@ -1052,8 +1155,10 @@ class PopupWindow(QWidget):
         self.discovery_thread.start()
 
     def handle_lamp_found(self, lamp_data):
-        mac = lamp_data.get('mac')
-        if mac and self.wiz_manager.add_lamp(mac, lamp_data.get('ip'), lamp_data.get('name')):
+        mac = lamp_data.get("mac")
+        if mac and self.wiz_manager.add_lamp(
+            mac, lamp_data.get("ip"), lamp_data.get("name")
+        ):
             self.load_content()
 
     def discovery_finished(self):
@@ -1069,6 +1174,7 @@ class PopupWindow(QWidget):
         self.raise_()
         self.activateWindow()
 
+
 class TrayAppQt:
     def __init__(self):
         self.app = QApplication(sys.argv)
@@ -1076,7 +1182,7 @@ class TrayAppQt:
         self.wiz_manager = WizManager()
 
         self.app.setFont(QFont("Segoe UI", 10))
-        
+
         icon_path = "icon.ico"
         icon_pixmap = QPixmap(icon_path)
         if icon_pixmap.isNull():
@@ -1084,7 +1190,7 @@ class TrayAppQt:
             return
         icon = QIcon(icon_pixmap)
         self.icon = QSystemTrayIcon(icon)
-        
+
         # Crear menú contextual
         menu = QMenu()
         show_action = QAction("Mostrar Control", menu)
@@ -1092,7 +1198,7 @@ class TrayAppQt:
         menu.addAction(show_action)
         menu.addAction(exit_action)
         self.icon.setContextMenu(menu)
-        
+
         # Mostrar ícono
         self.icon.setVisible(True)
 
@@ -1114,6 +1220,7 @@ class TrayAppQt:
     def run(self):
         return self.app.exec()
 
-if __name__ == '__main__':
+
+if __name__ == "__main__":
     app = TrayAppQt()
     sys.exit(app.run())
