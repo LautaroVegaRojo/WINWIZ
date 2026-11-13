@@ -81,16 +81,22 @@ def get_data_dir():
 
 
 # ---------------------------------------------------------------------------
-# Efecto "frosted glass": blur gaussiano en tiempo real del escritorio
+# Efecto "frosted glass": blur en tiempo real del escritorio
 # ---------------------------------------------------------------------------
-# La ventana se excluye del capturador de pantalla solo durante cada captura
-# (WDA_EXCLUDEFROMCAPTURE) para poder leer lo que hay detrás de ella sin
-# incluirse a sí misma. Luego se difumina esa imagen y se pinta como fondo.
-# Si el sistema no permite excluir la ventana, se intenta el blur acrílico
-# nativo de Windows como alternativa.
+# Método principal (Windows 11, build 22000+): DWM difumina el contenido que
+# hay detrás de la ventana en la GPU. No cuesta CPU, va a la frecuencia del
+# monitor y no parpadea. DWM recorta además la ventana con esquinas redondeadas.
+# Método alternativo (Windows 10 2004+): se excluye la ventana del capturador
+# (WDA_EXCLUDEFROMCAPTURE), se fotografía el escritorio de atrás y se difumina
+# esa imagen. Se usa solo si el sistema no soporta el blur nativo.
 
 _WDA_NONE = 0x00000000
 _WDA_EXCLUDEFROMCAPTURE = 0x00000011
+
+_DWMWA_WINDOW_CORNER_PREFERENCE = 33
+_DWMWCP_ROUND = 2
+_WCA_ACCENT_POLICY = 19
+_ACCENT_ENABLE_BLURBEHIND = 3
 
 
 def _set_display_affinity(hwnd, affinity):
@@ -124,16 +130,16 @@ class _WindowCompositionAttribData(ctypes.Structure):
     ]
 
 
-def _apply_accent_blur(hwnd):
-    """Blur acrílico nativo (Windows 10 1803+ / 11 21H2) como alternativa."""
+def _apply_blur_behind(hwnd):
+    """Activa el blur nativo de DWM detrás de la ventana (GPU, sin CPU)."""
     from ctypes import wintypes
 
     user32 = ctypes.windll.user32
-    # Formato AABBGGRR: tinte oscuro con alfa bajo, el blur hace el resto.
-    gradient_color = (0x50 << 24) | (0x20 << 16) | (0x20 << 8) | 0x20
-    accent = _AccentPolicy(4, 2, gradient_color, 0)  # 4 = ACRYLICBLURBEHIND
+    # Sin tinte propio: el color lo pone Qt en paintEvent así el resultado es
+    # idéntico al del método por captura.
+    accent = _AccentPolicy(_ACCENT_ENABLE_BLURBEHIND, 0, 0x00000000, 0)
     data = _WindowCompositionAttribData(
-        19,  # WCA_ACCENT_POLICY
+        _WCA_ACCENT_POLICY,
         ctypes.cast(ctypes.pointer(accent), ctypes.c_void_p),
         ctypes.sizeof(accent),
     )
@@ -143,16 +149,41 @@ def _apply_accent_blur(hwnd):
     return bool(setter(wintypes.HWND(hwnd), ctypes.byref(data)))
 
 
+def _set_round_corners(hwnd):
+    """Pide a DWM esquinas redondeadas para la ventana (Windows 11 build 22000+).
+
+    Devuelve False si el sistema no soporta la preferencia; en ese caso el
+    blur nativo quedaría con esquinas cuadradas y conviene el otro método."""
+    from ctypes import wintypes
+
+    try:
+        preference = ctypes.c_int(_DWMWCP_ROUND)
+        result = ctypes.windll.dwmapi.DwmSetWindowAttribute(
+            wintypes.HWND(hwnd),
+            _DWMWA_WINDOW_CORNER_PREFERENCE,
+            ctypes.byref(preference),
+            ctypes.sizeof(preference),
+        )
+        return result == 0
+    except Exception:
+        return False
+
+
 def enable_native_blur(window):
-    """Activa el blur acrílico nativo como fallback. Devuelve True si pudo."""
+    """Blur en vivo de DWM con esquinas redondeadas. Devuelve True si pudo."""
     if sys.platform != "win32":
         return False
     try:
-        if sys.getwindowsversion().build >= 17134:  # Windows 10 1803+
-            return _apply_accent_blur(int(window.winId()))
+        if sys.getwindowsversion().build < 22000:  # Windows 11
+            return False
+        hwnd = int(window.winId())
+        # Primero las esquinas: si el sistema no las soporta, el blur nativo
+        # dejaría las esquinas cuadradas y es mejor usar la captura.
+        if not _set_round_corners(hwnd):
+            return False
+        return _apply_blur_behind(hwnd)
     except Exception:
-        pass
-    return False
+        return False
 
 
 def blur_pixmap(pixmap, radius):
@@ -1203,7 +1234,7 @@ class PopupWindow(QWidget):
         self._backdrop_offset = QPoint(0, 0)
 
         self.blur_timer = QTimer(self)
-        self.blur_timer.setInterval(90)
+        self.blur_timer.setInterval(150)
         self.blur_timer.timeout.connect(self.refresh_backdrop)
 
         self.setWindowTitle("WiZ Control")
@@ -1244,9 +1275,16 @@ class PopupWindow(QWidget):
 
     def enable_frosted_glass(self):
         """Elige el método de blur disponible y arranca las actualizaciones."""
+        # Preferido: DWM difumina en la GPU. Cero CPU, sin parpadeos.
+        if enable_native_blur(self):
+            self._glass_mode = "native"
+            self.blur_timer.stop()
+            self.update()
+            return
+
         hwnd = int(self.winId())
-        # Windows 10 2004+ permite ocultar la ventana de las capturas, así
-        # podemos fotografiar el escritorio de atrás sin incluirnos.
+        # Alternativa en Windows 10 2004+: ocultar la ventana de las capturas
+        # para poder fotografiar el escritorio de atrás sin incluirnos.
         capture_supported = (
             sys.platform == "win32"
             and sys.getwindowsversion().build >= 19041
@@ -1257,8 +1295,6 @@ class PopupWindow(QWidget):
             self._glass_mode = "capture"
             self.refresh_backdrop()
             self.blur_timer.start()
-        elif enable_native_blur(self):
-            self._glass_mode = "acrylic"
         else:
             self._glass_mode = "none"
         self.update()
@@ -1385,9 +1421,9 @@ class PopupWindow(QWidget):
             if self._backdrop is not None:
                 painter.drawPixmap(self._backdrop_offset, self._backdrop)
             painter.fillRect(self.rect(), QColor(24, 24, 24, 135))
-        elif self._glass_mode == "acrylic":
-            # El blur acrílico nativo viste detrás de este tinte.
-            painter.fillRect(self.rect(), QColor(24, 24, 24, 120))
+        elif self._glass_mode == "native":
+            # DWM ya difumina el escritorio detrás: solo hace falta el tinte.
+            painter.fillRect(self.rect(), QColor(24, 24, 24, 135))
         else:
             painter.fillRect(self.rect(), QColor(32, 32, 32, 240))
 
