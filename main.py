@@ -2,6 +2,7 @@ import sys
 import json
 import socket
 import os
+import ctypes
 from PyQt6.QtWidgets import (
     QApplication,
     QWidget,
@@ -23,6 +24,9 @@ from PyQt6.QtWidgets import (
     QDialog,
     QListWidget,
     QListWidgetItem,
+    QGraphicsScene,
+    QGraphicsPixmapItem,
+    QGraphicsBlurEffect,
 )
 from PyQt6.QtGui import (
     QAction,
@@ -34,6 +38,9 @@ from PyQt6.QtGui import (
     QPainterPath,
     QIcon,
     QPixmap,
+    QLinearGradient,
+    QBrush,
+    QImage,
 )
 from PyQt6.QtCore import (
     QPoint,
@@ -71,6 +78,99 @@ def get_data_dir():
     path = os.path.join(base, "WizLampControl")
     os.makedirs(path, exist_ok=True)
     return path
+
+
+# ---------------------------------------------------------------------------
+# Efecto "frosted glass": blur gaussiano en tiempo real del escritorio
+# ---------------------------------------------------------------------------
+# La ventana se excluye del capturador de pantalla solo durante cada captura
+# (WDA_EXCLUDEFROMCAPTURE) para poder leer lo que hay detrás de ella sin
+# incluirse a sí misma. Luego se difumina esa imagen y se pinta como fondo.
+# Si el sistema no permite excluir la ventana, se intenta el blur acrílico
+# nativo de Windows como alternativa.
+
+_WDA_NONE = 0x00000000
+_WDA_EXCLUDEFROMCAPTURE = 0x00000011
+
+
+def _set_display_affinity(hwnd, affinity):
+    """Marca la ventana como invisible (o no) para las capturas de pantalla."""
+    if sys.platform != "win32":
+        return False
+    try:
+        return bool(
+            ctypes.windll.user32.SetWindowDisplayAffinity(
+                ctypes.c_void_p(hwnd), affinity
+            )
+        )
+    except Exception:
+        return False
+
+
+class _AccentPolicy(ctypes.Structure):
+    _fields_ = [
+        ("AccentState", ctypes.c_int),
+        ("AccentFlags", ctypes.c_int),
+        ("GradientColor", ctypes.c_uint),
+        ("AnimationId", ctypes.c_int),
+    ]
+
+
+class _WindowCompositionAttribData(ctypes.Structure):
+    _fields_ = [
+        ("Attribute", ctypes.c_int),
+        ("Data", ctypes.c_void_p),
+        ("SizeOfData", ctypes.c_size_t),
+    ]
+
+
+def _apply_accent_blur(hwnd):
+    """Blur acrílico nativo (Windows 10 1803+ / 11 21H2) como alternativa."""
+    from ctypes import wintypes
+
+    user32 = ctypes.windll.user32
+    # Formato AABBGGRR: tinte oscuro con alfa bajo, el blur hace el resto.
+    gradient_color = (0x50 << 24) | (0x20 << 16) | (0x20 << 8) | 0x20
+    accent = _AccentPolicy(4, 2, gradient_color, 0)  # 4 = ACRYLICBLURBEHIND
+    data = _WindowCompositionAttribData(
+        19,  # WCA_ACCENT_POLICY
+        ctypes.cast(ctypes.pointer(accent), ctypes.c_void_p),
+        ctypes.sizeof(accent),
+    )
+    setter = user32.SetWindowCompositionAttribute
+    setter.argtypes = [wintypes.HWND, ctypes.POINTER(_WindowCompositionAttribData)]
+    setter.restype = wintypes.BOOL
+    return bool(setter(wintypes.HWND(hwnd), ctypes.byref(data)))
+
+
+def enable_native_blur(window):
+    """Activa el blur acrílico nativo como fallback. Devuelve True si pudo."""
+    if sys.platform != "win32":
+        return False
+    try:
+        if sys.getwindowsversion().build >= 17134:  # Windows 10 1803+
+            return _apply_accent_blur(int(window.winId()))
+    except Exception:
+        pass
+    return False
+
+
+def blur_pixmap(pixmap, radius):
+    """Devuelve una copia difuminada del pixmap (blur tipo gaussiano)."""
+    scene = QGraphicsScene()
+    item = QGraphicsPixmapItem(pixmap)
+    effect = QGraphicsBlurEffect()
+    effect.setBlurRadius(radius)
+    effect.setBlurHints(QGraphicsBlurEffect.BlurHint.QualityHint)
+    item.setGraphicsEffect(effect)
+    scene.addItem(item)
+
+    image = QImage(pixmap.size(), QImage.Format.Format_ARGB32_Premultiplied)
+    image.fill(Qt.GlobalColor.transparent)
+    painter = QPainter(image)
+    scene.render(painter, QRectF(image.rect()), QRectF(pixmap.rect()))
+    painter.end()
+    return QPixmap.fromImage(image)
 
 
 class DiscoveryThread(QThread):
@@ -1098,6 +1198,13 @@ class PopupWindow(QWidget):
         self.check_timer.timeout.connect(self.check_hover_area)
 
         self._auto_hide_paused = False
+        self._glass_mode = "none"
+        self._backdrop = None
+        self._backdrop_offset = QPoint(0, 0)
+
+        self.blur_timer = QTimer(self)
+        self.blur_timer.setInterval(90)
+        self.blur_timer.timeout.connect(self.refresh_backdrop)
 
         self.setWindowTitle("WiZ Control")
         self.setWindowFlags(
@@ -1126,6 +1233,86 @@ class PopupWindow(QWidget):
     def hide(self):
         pass
 
+    def showEvent(self, event):
+        super().showEvent(event)
+        # El HWND ya existe en este punto: activamos el efecto de vidrio.
+        self.enable_frosted_glass()
+
+    def hideEvent(self, event):
+        self.blur_timer.stop()
+        super().hideEvent(event)
+
+    def enable_frosted_glass(self):
+        """Elige el método de blur disponible y arranca las actualizaciones."""
+        hwnd = int(self.winId())
+        # Windows 10 2004+ permite ocultar la ventana de las capturas, así
+        # podemos fotografiar el escritorio de atrás sin incluirnos.
+        capture_supported = (
+            sys.platform == "win32"
+            and sys.getwindowsversion().build >= 19041
+            and _set_display_affinity(hwnd, _WDA_EXCLUDEFROMCAPTURE)
+        )
+        if capture_supported:
+            _set_display_affinity(hwnd, _WDA_NONE)
+            self._glass_mode = "capture"
+            self.refresh_backdrop()
+            self.blur_timer.start()
+        elif enable_native_blur(self):
+            self._glass_mode = "acrylic"
+        else:
+            self._glass_mode = "none"
+        self.update()
+
+    def refresh_backdrop(self):
+        """Captura el escritorio detrás de la ventana y lo difumina."""
+        if self._glass_mode != "capture" or not self.isVisible():
+            return
+
+        geometry = self.frameGeometry()
+        screen = self.screen() or QApplication.primaryScreen()
+        visible = geometry.intersected(screen.geometry())
+        if visible.isEmpty():
+            return
+
+        hwnd = int(self.winId())
+        screen_origin = screen.geometry().topLeft()
+        _set_display_affinity(hwnd, _WDA_EXCLUDEFROMCAPTURE)
+        try:
+            grabbed = screen.grabWindow(
+                0,
+                visible.x() - screen_origin.x(),
+                visible.y() - screen_origin.y(),
+                visible.width(),
+                visible.height(),
+            )
+        finally:
+            _set_display_affinity(hwnd, _WDA_NONE)
+
+        if grabbed.isNull() or grabbed.width() == 0:
+            return
+
+        # Se reduce, se difumina y se vuelve a escalar: mismo resultado visual
+        # con mucho menos costo de CPU.
+        factor = 5
+        small = grabbed.scaled(
+            max(1, grabbed.width() // factor),
+            max(1, grabbed.height() // factor),
+            Qt.AspectRatioMode.IgnoreAspectRatio,
+            Qt.TransformationMode.SmoothTransformation,
+        )
+        small.setDevicePixelRatio(1.0)
+        blurred = blur_pixmap(small, factor + 1)
+        backdrop = blurred.scaled(
+            grabbed.size(),
+            Qt.AspectRatioMode.IgnoreAspectRatio,
+            Qt.TransformationMode.SmoothTransformation,
+        )
+        backdrop.setDevicePixelRatio(grabbed.devicePixelRatio())
+
+        self._backdrop = backdrop
+        self._backdrop_offset = visible.topLeft() - geometry.topLeft()
+        self.update()
+
     def get_detection_rect(self) -> QRect:
         win_rect = self.frameGeometry()
         margin_x = int(win_rect.width() * 0.10)
@@ -1139,10 +1326,15 @@ class PopupWindow(QWidget):
         self.check_timer.stop()
         self.animation.stop()
         self.setWindowOpacity(1.0)
+        # Congela el fondo mientras haya un diálogo encima: así no se captura
+        # su imagen dentro del blur y se ahorra CPU.
+        self.blur_timer.stop()
 
     def resume_auto_hide(self):
         """Reactiva el auto-cierre al cerrarse el diálogo hijo"""
         self._auto_hide_paused = False
+        if self._glass_mode == "capture" and self.isVisible():
+            self.blur_timer.start()
         if not self.get_detection_rect().contains(QCursor.pos()):
             self.hide_timer.start()
 
@@ -1186,9 +1378,27 @@ class PopupWindow(QWidget):
         path.addRoundedRect(QRectF(self.rect()), 8, 8)
 
         painter.setClipPath(path)
-        painter.fillRect(self.rect(), QColor(32, 32, 32, 240))
 
-        painter.setPen(QPen(QColor(255, 255, 255, 20), 1))
+        if self._glass_mode == "capture":
+            # El fondo es una foto difuminada del escritorio de atrás. Hasta la
+            # primera captura solo se ve el tinte, nunca un panel opaco.
+            if self._backdrop is not None:
+                painter.drawPixmap(self._backdrop_offset, self._backdrop)
+            painter.fillRect(self.rect(), QColor(24, 24, 24, 135))
+        elif self._glass_mode == "acrylic":
+            # El blur acrílico nativo viste detrás de este tinte.
+            painter.fillRect(self.rect(), QColor(24, 24, 24, 120))
+        else:
+            painter.fillRect(self.rect(), QColor(32, 32, 32, 240))
+
+        if self._glass_mode != "none":
+            # Brillo sutil en la parte superior, típico del vidrio esmerilado.
+            sheen = QLinearGradient(0, 0, 0, self.height())
+            sheen.setColorAt(0.0, QColor(255, 255, 255, 20))
+            sheen.setColorAt(0.45, QColor(255, 255, 255, 0))
+            painter.fillRect(self.rect(), QBrush(sheen))
+
+        painter.setPen(QPen(QColor(255, 255, 255, 28), 1))
         painter.drawRoundedRect(self.rect().adjusted(0, 0, -1, -1), 8, 8)
 
     def setup_ui(self):
