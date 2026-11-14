@@ -17,6 +17,7 @@ from PyQt6.QtWidgets import (
     QGridLayout,
     QSlider,
     QScrollArea,
+    QAbstractScrollArea,
     QFrame,
     QColorDialog,
     QCheckBox,
@@ -46,9 +47,11 @@ from PyQt6.QtGui import (
     QLinearGradient,
     QBrush,
     QImage,
+    QWheelEvent,
 )
 from PyQt6.QtCore import (
     QPoint,
+    QPointF,
     Qt,
     QThread,
     pyqtSignal,
@@ -58,6 +61,7 @@ from PyQt6.QtCore import (
     QRect,
     QEasingCurve,
     QRectF,
+    QEvent,
 )
 import time
 
@@ -102,15 +106,35 @@ DEFAULT_SETTINGS = {
     },
     "sliders": {
         "accent": "#005fb8",
-        "thickness": 4,  # 2-10 px
+        "thickness": 4,  # 2-28 px (el switch usa el mismo valor para su barra)
         "handle": 12,  # 6-24 px
     },
     "toggle": {
+        # "on" se sincroniza siempre con sliders.accent (no se edita aparte).
         "on": "#005fb8",  # botón encendido
         "off": "#5c5c5c",  # botón apagado
         "knob": "#ffffff",  # perilla
     },
 }
+
+# Rango compartido por sliders y switches. El grosor llega hasta 28 px para
+# que la barra del slider pueda igualar o superar el grosor de la barra del
+# switch, que nunca puede ser más fina que su perilla.
+SLIDER_THICKNESS_MIN = 2
+SLIDER_THICKNESS_MAX = 28
+SLIDER_HANDLE_MIN = 6
+SLIDER_HANDLE_MAX = 24
+
+
+def control_bar_height(thickness, handle):
+    """Alto de la barra de sliders y switches.
+
+    La barra siempre envuelve al tirador/perilla con 2 px de aire, así el
+    tirador queda adentro en los dos controles. Con el tirador y el grosor
+    por defecto da 16 px."""
+    bar = max(14, max(thickness, handle + 4))
+    bar = min(32, bar)
+    return bar - (bar % 2)
 
 
 def get_settings_path():
@@ -122,6 +146,20 @@ def _clamp_setting(value, minimum, maximum, fallback):
         return max(minimum, min(maximum, int(value)))
     except (TypeError, ValueError):
         return fallback
+
+
+def _even_setting(value, minimum, maximum, fallback):
+    """Entero **par** dentro del rango.
+
+    Qt dibuja el tirador con ``border-radius`` en píxeles enteros. Si el
+    tirador (o el grosor de la barra) es impar, el radio y el margen quedan
+    fraccionarios (por ejemplo ``6.5px``), Qt descarta esos valores y el
+    tirador sale con las esquinas cuadradas. Manteniéndolos pares, la división
+    es exacta y el círculo queda perfecto con cualquier tamaño."""
+    clamped = _clamp_setting(value, minimum, maximum, fallback)
+    if clamped % 2:
+        clamped += 1 if clamped < maximum else -1
+    return max(minimum, min(maximum, clamped))
 
 
 def _valid_color_setting(value, fallback):
@@ -163,11 +201,17 @@ def load_settings():
         settings["sliders"]["accent"] = _valid_color_setting(
             sliders.get("accent"), defaults["accent"]
         )
-        settings["sliders"]["thickness"] = _clamp_setting(
-            sliders.get("thickness"), 2, 10, defaults["thickness"]
+        settings["sliders"]["thickness"] = _even_setting(
+            sliders.get("thickness"),
+            SLIDER_THICKNESS_MIN,
+            SLIDER_THICKNESS_MAX,
+            defaults["thickness"],
         )
-        settings["sliders"]["handle"] = _clamp_setting(
-            sliders.get("handle"), 6, 24, defaults["handle"]
+        settings["sliders"]["handle"] = _even_setting(
+            sliders.get("handle"),
+            SLIDER_HANDLE_MIN,
+            SLIDER_HANDLE_MAX,
+            defaults["handle"],
         )
 
     toggle = stored.get("toggle")
@@ -177,6 +221,9 @@ def load_settings():
             settings["toggle"][key] = _valid_color_setting(
                 toggle.get(key), defaults[key]
             )
+    # El botón de encendido comparte el color de acento de los sliders: una
+    # sola opción controla las dos cosas.
+    settings["toggle"]["on"] = settings["sliders"]["accent"]
     return settings
 
 
@@ -376,22 +423,61 @@ class WizManager:
     def __init__(self):
         self.lamps = {}
         self.groups = {}
+        self._socket = None
+        # Guardar el JSON en cada movimiento del slider bloquea la interfaz
+        # (acceso a disco en el hilo de la UI). Se escribe una sola vez cuando
+        # el usuario deja de mover los controles.
+        self._save_timer = QTimer()
+        self._save_timer.setSingleShot(True)
+        self._save_timer.setInterval(600)
+        self._save_timer.timeout.connect(self._write_data)
         self.load_data()
 
     def load_data(self):
-        if os.path.exists(self.DATA_FILE):
-            with open(self.DATA_FILE, "r") as f:
-                try:
-                    data = json.load(f)
-                    self.lamps = data.get("lamps", {})
-                    self.groups = data.get("groups", {})
-                except json.JSONDecodeError:
-                    self.lamps = {}
-                    self.groups = {}
+        if not os.path.exists(self.DATA_FILE):
+            return
+        try:
+            with open(self.DATA_FILE, "r", encoding="utf-8") as f:
+                data = json.load(f)
+        except (OSError, ValueError):
+            self.lamps = {}
+            self.groups = {}
+            return
+        if isinstance(data, dict):
+            lamps = data.get("lamps")
+            groups = data.get("groups")
+            self.lamps = lamps if isinstance(lamps, dict) else {}
+            self.groups = groups if isinstance(groups, dict) else {}
+        else:
+            self.lamps = {}
+            self.groups = {}
 
     def save_data(self):
-        with open(self.DATA_FILE, "w") as f:
-            json.dump({"lamps": self.lamps, "groups": self.groups}, f, indent=4)
+        """Guarda ya mismo. Solo para cambios estructurales (agregar/borrar)."""
+        self._save_timer.stop()
+        self._write_data()
+
+    def schedule_save(self):
+        """Guarda en segundo plano cuando la UI queda quieta un momento."""
+        self._save_timer.start()
+
+    def flush(self):
+        """Escribe cualquier cambio pendiente (al cerrar la app)."""
+        if self._save_timer.isActive():
+            self._save_timer.stop()
+            self._write_data()
+
+    def shutdown(self):
+        self.flush()
+        self._close_socket()
+
+    def _write_data(self):
+        try:
+            with open(self.DATA_FILE, "w", encoding="utf-8") as f:
+                json.dump({"lamps": self.lamps, "groups": self.groups}, f, indent=4)
+        except OSError:
+            # Disco lleno / permisos: no se pierde la sesión en memoria.
+            pass
 
     def add_lamp(self, mac, ip, name):
         if mac not in self.lamps:
@@ -457,7 +543,7 @@ class WizManager:
                 self.lamps[mac]["last_color_hex"] = color_hex
             if last_temp_kelvin is not None:
                 self.lamps[mac]["last_temp_kelvin"] = last_temp_kelvin
-            self.save_data()
+            self.schedule_save()
 
     def get_lamps(self):
         return list(self.lamps.values())
@@ -471,14 +557,37 @@ class WizManager:
         return [lamp for lamp in self.lamps.values() if lamp["mac"] not in grouped_macs]
 
     def send_command(self, ip, command_params):
+        """Envía un comando UDP reutilizando un único socket.
+
+        Crear y cerrar un socket por comando era costoso al arrastrar un
+        slider (varios comandos por segundo); reutilizarlo mantiene el
+        movimiento fluido."""
+        sock = self._get_socket()
+        if sock is None:
+            return
         try:
-            sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-            sock.settimeout(0.05)
             command_json = json.dumps(command_params).encode("utf-8")
             sock.sendto(command_json, (ip, 38899))
-            sock.close()
-        except Exception:
-            pass
+        except OSError:
+            # El socket quedó inservible: se descarta y se recrea al próximo.
+            self._close_socket()
+
+    def _get_socket(self):
+        if self._socket is None:
+            try:
+                self._socket = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+                self._socket.setblocking(False)
+            except OSError:
+                self._socket = None
+        return self._socket
+
+    def _close_socket(self):
+        if self._socket is not None:
+            try:
+                self._socket.close()
+            except OSError:
+                pass
+            self._socket = None
 
     def send_command_to_group(self, group_name, command_params):
         """Envía un comando a todas las lámparas de un grupo"""
@@ -488,81 +597,370 @@ class WizManager:
 
 
 class ImprovedSlider(QSlider):
-    """Slider mejorado que sigue al mouse incluso fuera del área"""
+    """Slider que responde en todo el ancho y sigue al mouse.
 
-    valueChangedDelayed = pyqtSignal(int)  # Nueva señal con delay
+    Se dibuja a mano (no con QSS) para que el surco, el relleno y el tirador
+    queden perfectamente redondeados con cualquier combinación de grosor y
+    tamaño, incluso cuando el valor está en los extremos.
+
+    Puntos que se corrigieron respecto de la versión anterior:
+
+    * El temporizador ya **no se reinicia** en cada movimiento (eso era un
+      *debounce*): mientras se arrastra se emite como máximo un valor cada
+      ``THROTTLE_MS``, así la lámpara acompaña el movimiento en vivo en vez de
+      esperar a que se suelte el mouse.
+    * Si el botón se suelta fuera de la ventana (o el popup se oculta en medio
+      del arrastre), el estado de arrastre se libera igual y se envía el valor
+      final. Antes quedaba "pegado".
+    * La posición se traduce con ``QStyle.sliderValueFromPosition``, que usa el
+      ancho real del surco y respeta la dirección del slider.
+    * La rueda del mouse no cambia el valor sin querer: se deja pasar al scroll.
+    * El tirador queda siempre dentro del widget: en los extremos ya no se
+      recorta contra el borde.
+    """
+
+    valueChangedDelayed = pyqtSignal(int)
+
+    THROTTLE_MS = 60
+
+    COLOR_STOPS = (
+        (0.0, "#ff0000"),
+        (0.17, "#ffff00"),
+        (0.33, "#00ff00"),
+        (0.5, "#00ffff"),
+        (0.67, "#0000ff"),
+        (0.83, "#ff00ff"),
+        (1.0, "#ff0000"),
+    )
 
     def __init__(self, orientation, parent=None):
         super().__init__(orientation, parent)
+        # El fondo se dibuja a mano sobre el vidrio del popup: sin esto Qt
+        # pinta un fondo opaco de paleta detrás del slider.
+        self.setAttribute(Qt.WidgetAttribute.WA_NoSystemBackground, True)
         self._is_dragging = False
+        self._last_emitted = None
+        self._suspend_emit = False
 
-        # Timer para retrasar el envío de comandos
+        defaults = DEFAULT_SETTINGS["sliders"]
+        self._accent = QColor(defaults["accent"])
+        self._thickness = defaults["thickness"]
+        self._handle = defaults["handle"]
+        self._off_color = QColor(DEFAULT_SETTINGS["toggle"]["off"])
+        self._handle_color = QColor(DEFAULT_SETTINGS["toggle"]["knob"])
+        self._gradient = False
+        self._bar_height = control_bar_height(self._thickness, self._handle)
+        self.setMinimumHeight(self._bar_height + 4)
+
         self._update_timer = QTimer(self)
         self._update_timer.setSingleShot(True)
-        self._update_timer.setInterval(50)  # 50ms de delay
+        self._update_timer.setInterval(self.THROTTLE_MS)
         self._update_timer.timeout.connect(self._emit_delayed_value)
 
-        # Conectar el valueChanged original al timer
         self.valueChanged.connect(self._on_value_changed)
+        self.setCursor(Qt.CursorShape.PointingHandCursor)
+        self.setFocusPolicy(Qt.FocusPolicy.StrongFocus)
+
+    # -- apariencia --------------------------------------------------------
+
+    def apply_appearance(self, settings, gradient=False):
+        """Aplica los ajustes unificados de controles.
+
+        El acento, el color de apagado y el de la perilla se comparten con el
+        switch; el grosor y el tamaño del tirador también. Así un solo juego de
+        controles modifica sliders y botones a la vez.
+
+        ``gradient=True`` se usa para el slider de matiz (degradé arcoíris y
+        sin relleno)."""
+        sliders = settings["sliders"]
+        defaults = DEFAULT_SETTINGS["sliders"]
+        toggle = settings.get("toggle", DEFAULT_SETTINGS["toggle"])
+        toggle_defaults = DEFAULT_SETTINGS["toggle"]
+        self._accent = QColor(
+            _valid_color_setting(sliders.get("accent"), defaults["accent"])
+        )
+        self._thickness = _even_setting(
+            sliders.get("thickness"),
+            SLIDER_THICKNESS_MIN,
+            SLIDER_THICKNESS_MAX,
+            defaults["thickness"],
+        )
+        self._handle = _even_setting(
+            sliders.get("handle"),
+            SLIDER_HANDLE_MIN,
+            SLIDER_HANDLE_MAX,
+            defaults["handle"],
+        )
+        self._off_color = QColor(
+            _valid_color_setting(toggle.get("off"), toggle_defaults["off"])
+        )
+        self._handle_color = QColor(
+            _valid_color_setting(toggle.get("knob"), toggle_defaults["knob"])
+        )
+        self._gradient = bool(gradient)
+        self._bar_height = control_bar_height(self._thickness, self._handle)
+        self.setMinimumHeight(self._bar_height + 4)
+        self.update()
+
+    def _groove_rect(self):
+        """Barra completa del slider: el tirador siempre queda adentro."""
+        return QRectF(
+            0,
+            (self.height() - self._bar_height) / 2,
+            max(1.0, float(self.width())),
+            self._bar_height,
+        )
+
+    def _handle_padding(self):
+        """Aire entre el tirador y el borde de la barra.
+
+        Es el mismo margen que usa la perilla del switch (2 px cuando la
+        barra es fina y más si el grosor supera al tirador), así el tirador
+        del slider y la perilla del botón quedan ubicados igual."""
+        return max(0.0, (self._bar_height - self._handle) / 2)
+
+    def _travel_span(self):
+        """Recorrido del centro del tirador dentro de la barra."""
+        if self.orientation() == Qt.Orientation.Horizontal:
+            available = self.width() - self._handle - 2 * self._handle_padding()
+        else:
+            available = self.height() - self._handle - 2 * self._handle_padding()
+        return max(1, int(round(available)))
+
+    def _slider_position(self):
+        span = self._travel_span()
+        if self.orientation() == Qt.Orientation.Horizontal:
+            upside_down = self.invertedAppearance()
+        else:
+            upside_down = not self.invertedAppearance()
+        return QStyle.sliderPositionFromValue(
+            self.minimum(), self.maximum(), self.value(), span, upside_down
+        )
+
+    def paintEvent(self, event):
+        # Los sliders verticales no se usan en la app; se deja el dibujo
+        # nativo por si alguno aparece en el futuro.
+        if self.orientation() != Qt.Orientation.Horizontal:
+            super().paintEvent(event)
+            return
+
+        painter = QPainter(self)
+        painter.setRenderHint(QPainter.RenderHint.Antialiasing)
+        painter.setPen(Qt.PenStyle.NoPen)
+
+        groove = self._groove_rect()
+        radius = groove.height() / 2
+        position = self._slider_position()
+        center_x = self._handle_padding() + self._handle / 2 + position
+
+        if self._gradient:
+            gradient = QLinearGradient(groove.left(), 0, groove.right(), 0)
+            for stop, color in self.COLOR_STOPS:
+                gradient.setColorAt(stop, QColor(color))
+            painter.setBrush(QBrush(gradient))
+            painter.drawRoundedRect(groove, radius, radius)
+        else:
+            span = self._travel_span()
+            if position <= 0:
+                # Todo apagado: una sola píldora continua, igual que el
+                # switch apagado.
+                painter.setBrush(self._off_color)
+                painter.drawRoundedRect(groove, radius, radius)
+            elif position >= span:
+                # Todo encendido: también una sola píldora, así no queda el
+                # color de apagado alrededor del tirador.
+                painter.setBrush(self._accent)
+                painter.drawRoundedRect(groove, radius, radius)
+            else:
+                # Barra continua: se dibuja UNA sola píldora completa y el
+                # cambio de color se hace con un degradé suave CENTRADO en el
+                # tirador: el acento se desvanece hacia el apagado a lo ancho
+                # del tirador. En el centro de la barra lo tapa el tirador y
+                # en las franjas de arriba/abajo se ve una transición
+                # difuminada, sin costura ni borde recto.
+                fade = max(10.0, float(self._handle))
+                bar_width = max(1.0, groove.width())
+                fade_start = max(groove.left(), center_x - fade / 2)
+                fade_end = min(groove.right(), center_x + fade / 2)
+                start = (fade_start - groove.left()) / bar_width
+                end = (fade_end - groove.left()) / bar_width
+                gradient = QLinearGradient(groove.left(), 0, groove.right(), 0)
+                gradient.setColorAt(0.0, self._accent)
+                gradient.setColorAt(max(0.0, start), self._accent)
+                gradient.setColorAt(min(1.0, end), self._off_color)
+                gradient.setColorAt(1.0, self._off_color)
+                painter.setBrush(QBrush(gradient))
+                painter.drawRoundedRect(groove, radius, radius)
+
+        # Tirador: mismo color que la perilla del switch y con el mismo aire
+        # respecto de la barra.
+        padding = self._handle_padding()
+        painter.setBrush(self._handle_color)
+        painter.drawEllipse(
+            QRectF(
+                center_x - self._handle / 2,
+                groove.top() + padding,
+                self._handle,
+                self._handle,
+            )
+        )
+
+    # -- emisión -----------------------------------------------------------
+
+    def set_value_silently(self, value):
+        """Cambia el valor sin disparar ``valueChangedDelayed``.
+
+        Se usa para sincronizaciones (estado inicial de la tarjeta, cambios
+        que llegan desde un grupo o desde el selector de color). Si no, Qt
+        trata el ``setValue`` como una acción del usuario y manda comandos a
+        las lámparas apenas se abre el panel."""
+        self._suspend_emit = True
+        try:
+            self.setValue(value)
+        finally:
+            self._suspend_emit = False
+        self._update_timer.stop()
+        self._last_emitted = self.value()
 
     def _on_value_changed(self, value):
-        """Se llama cada vez que cambia el valor"""
-        # Si estamos arrastrando, reiniciar el timer
-        if self._is_dragging:
+        if self._suspend_emit:
+            return
+        # Un único timer activo a la vez (throttle). No se reinicia con cada
+        # evento, por eso los comandos salen también durante el arrastre.
+        if not self._update_timer.isActive():
             self._update_timer.start()
-        else:
-            # Si no estamos arrastrando (click directo), emitir inmediatamente
-            self.valueChangedDelayed.emit(value)
 
     def _emit_delayed_value(self):
-        """Emite el valor después del delay"""
-        self.valueChangedDelayed.emit(self.value())
+        value = self.value()
+        if value == self._last_emitted:
+            return
+        self._last_emitted = value
+        self.valueChangedDelayed.emit(value)
+
+    # -- arrastre ----------------------------------------------------------
+
+    def _start_drag(self):
+        self._is_dragging = True
+        self.setSliderDown(True)
+        self.setFocus(Qt.FocusReason.MouseFocusReason)
+        hook = getattr(self.window(), "slider_interaction_started", None)
+        if hook is not None:
+            hook()
+
+    def _finish_drag(self):
+        if not self._is_dragging:
+            self._update_timer.stop()
+            return
+        self._is_dragging = False
+        self.setSliderDown(False)
+        self._update_timer.stop()
+        self._emit_delayed_value()  # valor final, sin esperar al throttle
+        hook = getattr(self.window(), "slider_interaction_finished", None)
+        if hook is not None:
+            hook()
 
     def mousePressEvent(self, event):
         if event.button() == Qt.MouseButton.LeftButton:
-            self._is_dragging = True
-            # Calcular y establecer el valor según la posición del click
-            self._update_value_from_position(event.pos())
+            self._start_drag()
+            self._update_value_from_position(event.position().toPoint())
             event.accept()
         else:
             super().mousePressEvent(event)
 
     def mouseMoveEvent(self, event):
         if self._is_dragging:
-            self._update_value_from_position(event.pos())
+            # Red de seguridad: si el release se perdió (por ejemplo al
+            # ocultarse el popup), el próximo movimiento lo detecta.
+            if not (event.buttons() & Qt.MouseButton.LeftButton):
+                self._finish_drag()
+                return
+            self._update_value_from_position(event.position().toPoint())
             event.accept()
         else:
             super().mouseMoveEvent(event)
 
     def mouseReleaseEvent(self, event):
-        if event.button() == Qt.MouseButton.LeftButton:
-            self._is_dragging = False
-            # Al soltar, emitir el valor final inmediatamente
-            self._update_timer.stop()
-            self.valueChangedDelayed.emit(self.value())
+        if event.button() == Qt.MouseButton.LeftButton and self._is_dragging:
+            self._update_value_from_position(event.position().toPoint())
+            self._finish_drag()
             event.accept()
         else:
             super().mouseReleaseEvent(event)
 
+    def hideEvent(self, event):
+        self._finish_drag()
+        super().hideEvent(event)
+
+    def focusOutEvent(self, event):
+        # Si otra ventana se queda con el foco en medio del arrastre, el
+        # release nunca llega a este widget: se cierra igual y se avisa el
+        # valor final.
+        if self._is_dragging:
+            self._finish_drag()
+        super().focusOutEvent(event)
+
+    def changeEvent(self, event):
+        if event.type() == QEvent.Type.EnabledChange and not self.isEnabled():
+            self._finish_drag()
+        super().changeEvent(event)
+
+    def wheelEvent(self, event):
+        """La rueda no cambia el brillo sin querer: scrollea el panel.
+
+        Se reenvía al ``QScrollArea`` que contiene al slider; si no hay uno,
+        se ignora. Así el panel se puede recorrer con la rueda aunque el
+        cursor esté sobre un control."""
+        area = self.parentWidget()
+        while area is not None and not isinstance(area, QAbstractScrollArea):
+            area = area.parentWidget()
+        if area is None:
+            event.ignore()
+            return
+        viewport = area.viewport()
+        local_pos = viewport.mapFromGlobal(event.globalPosition().toPoint())
+        QApplication.sendEvent(
+            viewport,
+            QWheelEvent(
+                QPointF(local_pos),
+                event.globalPosition(),
+                event.pixelDelta(),
+                event.angleDelta(),
+                event.buttons(),
+                event.modifiers(),
+                event.phase(),
+                event.inverted(),
+            ),
+        )
+        event.accept()
+
     def _update_value_from_position(self, pos):
-        """Calcula el valor del slider según la posición del mouse"""
+        """Calcula el valor del slider según la posición del mouse.
+
+        Se descuenta el aire lateral y media pieza del tirador para que su
+        centro recorra el mismo tramo que se usa al dibujarlo: así el tirador
+        queda siempre completo y con el mismo margen que la perilla del
+        switch."""
+        padding = self._handle_padding()
+        span = self._travel_span()
         if self.orientation() == Qt.Orientation.Horizontal:
-            # Calcular el porcentaje de la posición en el ancho del slider
-            groove_width = self.width()
-            position = max(0, min(pos.x(), groove_width))
-            percentage = position / groove_width
+            position = max(
+                0, min(pos.x() - padding - self._handle / 2, span)
+            )
+            upside_down = self.invertedAppearance()
         else:
-            # Para sliders verticales
-            groove_height = self.height()
-            position = max(0, min(pos.y(), groove_height))
-            percentage = 1.0 - (position / groove_height)  # Invertido para vertical
-
-        # Convertir el porcentaje al rango del slider
-        value_range = self.maximum() - self.minimum()
-        new_value = int(self.minimum() + (percentage * value_range))
-
-        # Establecer el valor
-        self.setValue(new_value)
+            position = max(
+                0, min(pos.y() - padding - self._handle / 2, span)
+            )
+            upside_down = not self.invertedAppearance()
+        self.setValue(
+            QStyle.sliderValueFromPosition(
+                self.minimum(),
+                self.maximum(),
+                int(round(position)),
+                span,
+                upside_down,
+            )
+        )
 
 
 class ModernToggle(QWidget):
@@ -570,6 +968,8 @@ class ModernToggle(QWidget):
 
     # Paleta compartida: PopupWindow y el diálogo la actualizan según settings.
     colors = {"on": "#005fb8", "off": "#5c5c5c", "knob": "#ffffff"}
+    # Grosor de barra y tamaño de tirador compartidos con los sliders.
+    metrics = {"thickness": 4, "handle": 12}
 
     @classmethod
     def set_colors(cls, colors):
@@ -583,15 +983,58 @@ class ModernToggle(QWidget):
         if merged == cls.colors:
             return
         cls.colors = merged
+        cls._refresh_widgets()
+
+    @classmethod
+    def set_metrics(cls, metrics):
+        """Actualiza grosor y tamaño de perilla de todos los toggles.
+
+        Son los mismos valores que usan los sliders, así un solo control
+        modifica ambos componentes."""
+        defaults = DEFAULT_SETTINGS["sliders"]
+        thickness = _even_setting(
+            metrics.get("thickness"),
+            SLIDER_THICKNESS_MIN,
+            SLIDER_THICKNESS_MAX,
+            defaults["thickness"],
+        )
+        handle = _even_setting(
+            metrics.get("handle"),
+            SLIDER_HANDLE_MIN,
+            SLIDER_HANDLE_MAX,
+            defaults["handle"],
+        )
+        if (thickness, handle) == (cls.metrics["thickness"], cls.metrics["handle"]):
+            return
+        cls.metrics = {"thickness": thickness, "handle": handle}
+        cls._refresh_widgets()
+
+    @classmethod
+    def apply_appearance(cls, settings):
+        """Colores + métricas en una sola llamada (sliders y botones unificados)."""
+        sliders = settings.get("sliders", {}) if isinstance(settings, dict) else {}
+        toggle = settings.get("toggle", {}) if isinstance(settings, dict) else {}
+        # El "encendido" siempre es el acento del slider, aunque el llamador
+        # pase un valor viejo: una sola opción manda en ambos componentes.
+        colors = dict(toggle) if isinstance(toggle, dict) else {}
+        if sliders.get("accent"):
+            colors["on"] = sliders["accent"]
+        cls.set_colors(colors)
+        cls.set_metrics(sliders)
+
+    @classmethod
+    def _refresh_widgets(cls):
         app = QApplication.instance()
         if app is not None:
             for widget in app.allWidgets():
                 if isinstance(widget, ModernToggle):
+                    widget._apply_metrics()
                     widget.update()
 
     def __init__(self, parent=None):
         super().__init__(parent)
-        self.setFixedSize(40, 20)
+        # El fondo se dibuja completo con los bordes redondeados.
+        self.setAttribute(Qt.WidgetAttribute.WA_NoSystemBackground, True)
         self._checked = False
         self._position = 0.0
         self._anim = QVariantAnimation(self)
@@ -599,6 +1042,24 @@ class ModernToggle(QWidget):
         self._anim.setEasingCurve(QEasingCurve.Type.OutCubic)
         self._anim.valueChanged.connect(self._on_anim)
         self.setCursor(Qt.CursorShape.PointingHandCursor)
+        self._apply_metrics()
+
+    def _geometry(self):
+        """Dimensiones derivadas de los ajustes compartidos con los sliders.
+
+        La barra del switch usa el mismo alto que la del slider y siempre
+        envuelve a la perilla. La perilla mide lo mismo que el tirador."""
+        thickness = self.metrics["thickness"]
+        handle = self.metrics["handle"]
+        bar = control_bar_height(thickness, handle)
+        knob = min(handle, bar - 4)
+        return bar * 2, bar, knob
+
+    def _apply_metrics(self):
+        width, height, _ = self._geometry()
+        if self.width() != width or self.height() != height:
+            self.setFixedSize(width, height)
+        self.update()
 
     def _on_anim(self, value):
         self._position = float(value)
@@ -650,16 +1111,15 @@ class ModernToggle(QWidget):
             round(off.blue() + (on.blue() - off.blue()) * t),
         )
 
-        width = self.width()
-        height = self.height()
+        width, height, knob = self._geometry()
         radius = height / 2
         painter.setBrush(background)
         painter.drawRoundedRect(QRectF(0, 0, width, height), radius, radius)
 
-        knob = height - 4
-        x = 2 + (width - knob - 4) * t
+        padding = (height - knob) / 2
+        x = padding + (width - knob - 2 * padding) * t
         painter.setBrush(QColor(self.colors["knob"]))
-        painter.drawEllipse(QRectF(x, 2, knob, knob))
+        painter.drawEllipse(QRectF(x, padding, knob, knob))
 
 
 class HoverButton(QPushButton):
@@ -718,9 +1178,13 @@ class HoverButton(QPushButton):
 
 
 class FolderIcon(QWidget):
-    """Icono de carpeta minimalista, dibujado con trazo blanco."""
+    """Icono de carpeta relleno, en la misma línea visual que el engranaje.
 
-    def __init__(self, parent=None, size=15, color=QColor("#E8E8E8")):
+    Se dibuja como dos piezas sólidas con esquinas redondeadas (pestaña y
+    cuerpo) en lugar del contorno fino anterior, que a 15 px se veía más
+    "dibujado a mano" que el resto de los iconos."""
+
+    def __init__(self, parent=None, size=16, color=QColor("#D0D0D0")):
         super().__init__(parent)
         self.setFixedSize(size, size)
         self._color = QColor(color)
@@ -732,30 +1196,28 @@ class FolderIcon(QWidget):
     def paintEvent(self, event):
         painter = QPainter(self)
         painter.setRenderHint(QPainter.RenderHint.Antialiasing)
-        pen = QPen(self._color)
-        pen.setWidthF(1.4)
-        pen.setCapStyle(Qt.PenCapStyle.RoundCap)
-        pen.setJoinStyle(Qt.PenJoinStyle.RoundJoin)
-        painter.setPen(pen)
-        painter.setBrush(Qt.BrushStyle.NoBrush)
+        painter.setPen(Qt.PenStyle.NoPen)
 
         w = float(self.width())
         h = float(self.height())
-        path = QPainterPath()
-        path.moveTo(0.12 * w, 0.80 * h)
-        path.lineTo(0.12 * w, 0.26 * h)
-        path.cubicTo(0.12 * w, 0.21 * h, 0.15 * w, 0.18 * h, 0.20 * w, 0.18 * h)
-        path.lineTo(0.40 * w, 0.18 * h)
-        path.cubicTo(0.45 * w, 0.18 * h, 0.48 * w, 0.20 * h, 0.50 * w, 0.24 * h)
-        path.lineTo(0.53 * w, 0.30 * h)
-        path.lineTo(0.84 * w, 0.30 * h)
-        path.cubicTo(0.88 * w, 0.30 * h, 0.90 * w, 0.33 * h, 0.90 * w, 0.37 * h)
-        path.lineTo(0.90 * w, 0.78 * h)
-        path.cubicTo(0.90 * w, 0.82 * h, 0.87 * w, 0.84 * h, 0.83 * w, 0.84 * h)
-        path.lineTo(0.17 * w, 0.84 * h)
-        path.cubicTo(0.13 * w, 0.84 * h, 0.12 * w, 0.82 * h, 0.12 * w, 0.78 * h)
-        path.closeSubpath()
-        painter.drawPath(path)
+
+        # Pestaña trasera: un poco más apagada para dar profundidad.
+        tab = QColor(self._color)
+        tab.setAlphaF(0.72)
+        painter.setBrush(tab)
+        painter.drawRoundedRect(
+            QRectF(0.10 * w, 0.20 * h, 0.42 * w, 0.20 * h),
+            0.05 * w,
+            0.05 * w,
+        )
+
+        # Cuerpo de la carpeta.
+        painter.setBrush(self._color)
+        painter.drawRoundedRect(
+            QRectF(0.08 * w, 0.28 * h, 0.84 * w, 0.54 * h),
+            0.10 * w,
+            0.10 * w,
+        )
 
 
 class LampControl(QWidget):
@@ -828,7 +1290,7 @@ class LampControl(QWidget):
 
         self.brightness_slider = ImprovedSlider(Qt.Orientation.Horizontal)
         self.brightness_slider.setRange(10, 100)
-        self.brightness_slider.setValue(initial_brightness)
+        self.brightness_slider.set_value_silently(initial_brightness)
         self.brightness_slider.valueChangedDelayed.connect(self.send_brightness_command)
         self.brightness_slider.valueChanged.connect(self.update_brightness_label)
         brightness_layout.addWidget(self.brightness_slider)
@@ -851,7 +1313,7 @@ class LampControl(QWidget):
 
         self.temp_slider = ImprovedSlider(Qt.Orientation.Horizontal)
         self.temp_slider.setRange(0, 100)
-        self.temp_slider.setValue(self.kelvin_to_slider(self.current_temp))
+        self.temp_slider.set_value_silently(self.kelvin_to_slider(self.current_temp))
         self.temp_slider.valueChangedDelayed.connect(self.send_temp_command)
         self.temp_slider.valueChanged.connect(self.update_temp_label)
         temp_layout.addWidget(self.temp_slider)
@@ -874,7 +1336,7 @@ class LampControl(QWidget):
 
         self.color_slider = ImprovedSlider(Qt.Orientation.Horizontal)
         self.color_slider.setRange(0, 359)
-        self.color_slider.setValue(self.current_hue)
+        self.color_slider.set_value_silently(self.current_hue)
         self.color_slider.setObjectName("colorSlider")
         self.color_slider.valueChangedDelayed.connect(self.send_color_command)
         self.color_slider.valueChanged.connect(self.update_color_preview_only)
@@ -946,6 +1408,7 @@ class LampControl(QWidget):
     def send_brightness_command(self, value):
         self.wiz_manager.update_lamp_state(self.mac, brightness=value)
         if not self.is_on:
+            self.is_on = True
             self.toggle.setChecked(True)
         command = {"method": "setPilot", "params": {"dimming": value, "state": True}}
         self.wiz_manager.send_command(self.ip, command)
@@ -955,6 +1418,7 @@ class LampControl(QWidget):
         self.current_temp = kelvin
         self.wiz_manager.update_lamp_state(self.mac, last_temp_kelvin=kelvin)
         if not self.is_on:
+            self.is_on = True
             self.toggle.setChecked(True)
         command = {
             "method": "setPilot",
@@ -974,6 +1438,7 @@ class LampControl(QWidget):
 
         self.wiz_manager.update_lamp_state(self.mac, color_hex=color.name())
         if not self.is_on:
+            self.is_on = True
             self.toggle.setChecked(True)
 
         r, g, b = color.red(), color.green(), color.blue()
@@ -1010,13 +1475,12 @@ class LampControl(QWidget):
             self.current_hue = color.hue()
 
         # Sincronizar el slider de matiz sin re-disparar el comando
-        self.color_slider.blockSignals(True)
-        self.color_slider.setValue(self.current_hue)
-        self.color_slider.blockSignals(False)
+        self.color_slider.set_value_silently(self.current_hue)
         self.update_color_preview()
 
         self.wiz_manager.update_lamp_state(self.mac, color_hex=color.name())
         if not self.is_on:
+            self.is_on = True
             self.toggle.setChecked(True)
 
         r, g, b = color.red(), color.green(), color.blue()
@@ -1074,11 +1538,13 @@ class GroupControl(QWidget):
 
         # Header con flecha expandible
         header = QWidget()
+        header.setCursor(Qt.CursorShape.PointingHandCursor)
         header_layout = QHBoxLayout(header)
         header_layout.setContentsMargins(0, 0, 0, 0)
         header_layout.setSpacing(8)
 
-        # Flecha de expansión (solo la flecha es clickeable)
+        # Toda la zona del nombre expande/colapsa el grupo: la flecha sola es
+        # un blanco muy chico y era fácil errarle.
         arrow_container = QWidget()
         arrow_container.setCursor(Qt.CursorShape.PointingHandCursor)
         arrow_layout = QHBoxLayout(arrow_container)
@@ -1094,6 +1560,7 @@ class GroupControl(QWidget):
                 self.toggle_expansion()
 
         arrow_container.mousePressEvent = arrow_click
+        header.mousePressEvent = arrow_click
 
         header_layout.addWidget(arrow_container)
 
@@ -1102,7 +1569,7 @@ class GroupControl(QWidget):
         name_layout = QHBoxLayout(name_row)
         name_layout.setContentsMargins(0, 0, 0, 0)
         name_layout.setSpacing(6)
-        self.folder_icon = FolderIcon(size=15, color=QColor("#E8E8E8"))
+        self.folder_icon = FolderIcon()
         name_layout.addWidget(self.folder_icon)
         name_label = QLabel(self.group_name)
         name_label.setObjectName("groupName")
@@ -1149,7 +1616,7 @@ class GroupControl(QWidget):
 
         self.brightness_slider = ImprovedSlider(Qt.Orientation.Horizontal)
         self.brightness_slider.setRange(10, 100)
-        self.brightness_slider.setValue(self.current_brightness)
+        self.brightness_slider.set_value_silently(self.current_brightness)
         self.brightness_slider.valueChangedDelayed.connect(self.send_brightness_command)
         self.brightness_slider.valueChanged.connect(self.update_brightness_label)
         brightness_layout.addWidget(self.brightness_slider)
@@ -1172,7 +1639,7 @@ class GroupControl(QWidget):
 
         self.temp_slider = ImprovedSlider(Qt.Orientation.Horizontal)
         self.temp_slider.setRange(0, 100)
-        self.temp_slider.setValue(self.kelvin_to_slider(self.current_temp))
+        self.temp_slider.set_value_silently(self.kelvin_to_slider(self.current_temp))
         self.temp_slider.valueChangedDelayed.connect(self.send_temp_command)
         self.temp_slider.valueChanged.connect(self.update_temp_label)
         temp_layout.addWidget(self.temp_slider)
@@ -1195,7 +1662,7 @@ class GroupControl(QWidget):
 
         self.color_slider = ImprovedSlider(Qt.Orientation.Horizontal)
         self.color_slider.setRange(0, 359)
-        self.color_slider.setValue(self.current_hue)
+        self.color_slider.set_value_silently(self.current_hue)
         self.color_slider.setObjectName("colorSlider")
         self.color_slider.valueChangedDelayed.connect(self.send_color_command)
         self.color_slider.valueChanged.connect(self.update_color_preview_only)
@@ -1298,6 +1765,7 @@ class GroupControl(QWidget):
 
         # Actualizar toggles de las lámparas individuales
         for lamp_widget in self.lamp_widgets:
+            lamp_widget.is_on = is_on
             lamp_widget.toggle.setChecked(is_on)
 
     def send_brightness_command(self, value):
@@ -1306,6 +1774,7 @@ class GroupControl(QWidget):
         self.brightness_value.setText(f"{value}%")
 
         if not self.is_on:
+            self.is_on = True
             self.toggle.setChecked(True)
 
         command = {"method": "setPilot", "params": {"dimming": value, "state": True}}
@@ -1313,10 +1782,9 @@ class GroupControl(QWidget):
 
         # Actualizar sliders de las lámparas individuales
         for lamp_widget in self.lamp_widgets:
-            lamp_widget.brightness_slider.blockSignals(True)
-            lamp_widget.brightness_slider.setValue(value)
-            lamp_widget.brightness_value.setText(f"{value}%")
-            lamp_widget.brightness_slider.blockSignals(False)
+            lamp_widget.is_on = True
+            lamp_widget.toggle.setChecked(True)
+            lamp_widget.brightness_slider.set_value_silently(value)
 
     def send_temp_command(self, slider_val):
         """Envía comando de temperatura a todas las lámparas del grupo"""
@@ -1325,6 +1793,7 @@ class GroupControl(QWidget):
         self.temp_value.setText(f"{kelvin}K")
 
         if not self.is_on:
+            self.is_on = True
             self.toggle.setChecked(True)
 
         command = {
@@ -1340,11 +1809,10 @@ class GroupControl(QWidget):
 
         # Actualizar sliders de las lámparas individuales
         for lamp_widget in self.lamp_widgets:
-            lamp_widget.temp_slider.blockSignals(True)
-            lamp_widget.temp_slider.setValue(slider_val)
-            lamp_widget.temp_value.setText(f"{kelvin}K")
+            lamp_widget.is_on = True
+            lamp_widget.toggle.setChecked(True)
+            lamp_widget.temp_slider.set_value_silently(slider_val)
             lamp_widget.current_temp = kelvin
-            lamp_widget.temp_slider.blockSignals(False)
 
     def send_color_command(self, hue):
         """Envía comando de color a todas las lámparas del grupo"""
@@ -1354,6 +1822,7 @@ class GroupControl(QWidget):
         self.update_color_preview()
 
         if not self.is_on:
+            self.is_on = True
             self.toggle.setChecked(True)
 
         r, g, b = color.red(), color.green(), color.blue()
@@ -1373,12 +1842,12 @@ class GroupControl(QWidget):
 
         # Actualizar sliders de las lámparas individuales
         for lamp_widget in self.lamp_widgets:
-            lamp_widget.color_slider.blockSignals(True)
-            lamp_widget.color_slider.setValue(hue)
+            lamp_widget.is_on = True
+            lamp_widget.toggle.setChecked(True)
+            lamp_widget.color_slider.set_value_silently(hue)
             lamp_widget.current_hue = hue
             lamp_widget.current_color = color
             lamp_widget.update_color_preview()
-            lamp_widget.color_slider.blockSignals(False)
 
     def open_color_picker(self):
         popup = self.window()
@@ -1398,12 +1867,11 @@ class GroupControl(QWidget):
         if color.hue() >= 0:
             self.current_hue = color.hue()
 
-        self.color_slider.blockSignals(True)
-        self.color_slider.setValue(self.current_hue)
-        self.color_slider.blockSignals(False)
+        self.color_slider.set_value_silently(self.current_hue)
         self.update_color_preview()
 
         if not self.is_on:
+            self.is_on = True
             self.toggle.setChecked(True)
 
         r, g, b = color.red(), color.green(), color.blue()
@@ -1423,12 +1891,12 @@ class GroupControl(QWidget):
 
         # Aplicar el mismo color exacto a cada lámpara individual del grupo
         for lamp_widget in self.lamp_widgets:
-            lamp_widget.color_slider.blockSignals(True)
-            lamp_widget.color_slider.setValue(self.current_hue)
+            lamp_widget.is_on = True
+            lamp_widget.toggle.setChecked(True)
+            lamp_widget.color_slider.set_value_silently(self.current_hue)
             lamp_widget.current_hue = self.current_hue
             lamp_widget.current_color = color
             lamp_widget.update_color_preview()
-            lamp_widget.color_slider.blockSignals(False)
             lamp_widget.wiz_manager.update_lamp_state(
                 lamp_widget.mac, color_hex=color.name()
             )
@@ -1512,6 +1980,14 @@ class SettingsDialog(QDialog):
         self._tint_color = QColor(settings["glass"]["tint"])
         self._accent_color = QColor(settings["sliders"]["accent"])
 
+        # Aplicar la vista previa en cada píxel del arrastre re-estiliza el
+        # popup y hasta recaptura la pantalla. Con 70 ms de retraso se siente
+        # igual de inmediato pero sin tirones.
+        self._preview_timer = QTimer(self)
+        self._preview_timer.setSingleShot(True)
+        self._preview_timer.setInterval(70)
+        self._preview_timer.timeout.connect(self._emit_preview)
+
         self.setWindowTitle("Ajustes de apariencia")
         self.setModal(True)
         self.setMinimumWidth(390)
@@ -1588,71 +2064,42 @@ class SettingsDialog(QDialog):
 
         root.addWidget(glass_group)
 
-        # --- Sliders ------------------------------------------------------
-        sliders_group = QGroupBox("Sliders")
-        sliders_grid = QGridLayout(sliders_group)
-        sliders_grid.setContentsMargins(12, 18, 12, 12)
-        sliders_grid.setHorizontalSpacing(10)
-        sliders_grid.setVerticalSpacing(8)
-        sliders_grid.setColumnStretch(1, 1)
+        # --- Controles (mismas opciones para sliders y botones) -----------
+        controls_group = QGroupBox("Sliders y botones de encendido")
+        controls_grid = QGridLayout(controls_group)
+        controls_grid.setContentsMargins(12, 18, 12, 12)
+        controls_grid.setHorizontalSpacing(10)
+        controls_grid.setVerticalSpacing(8)
+        controls_grid.setColumnStretch(1, 1)
 
+        # Un único juego de ajustes: cada opción modifica el slider y el switch
+        # al mismo tiempo.
         self.accent_swatch = QPushButton()
         self.accent_swatch.setObjectName("colorSwatch")
         self.accent_swatch.setFixedSize(64, 22)
         self.accent_swatch.setCursor(Qt.CursorShape.PointingHandCursor)
-        self.accent_swatch.setToolTip("Elegir color de acento")
+        self.accent_swatch.setToolTip(
+            "Color de acento: relleno del slider y botón encendido"
+        )
         self.accent_hex = QLabel()
         self.accent_hex.setObjectName("settingValue")
         self._update_swatch(self.accent_swatch, self._accent_color)
-        sliders_grid.addWidget(QLabel("Color de acento:"), 0, 0)
-        sliders_grid.addWidget(
+        controls_grid.addWidget(QLabel("Color de acento:"), 0, 0)
+        controls_grid.addWidget(
             self._color_control(self.accent_swatch, self.accent_hex), 0, 1, 1, 2
         )
 
-        (
-            self.thickness_slider,
-            self.thickness_value,
-            thickness_control,
-        ) = self._make_slider_row(2, 10, settings["sliders"]["thickness"])
-        sliders_grid.addWidget(QLabel("Grosor de la barra:"), 1, 0)
-        sliders_grid.addWidget(thickness_control, 1, 1, 1, 2)
-
-        (
-            self.handle_slider,
-            self.handle_value,
-            handle_control,
-        ) = self._make_slider_row(6, 24, settings["sliders"]["handle"])
-        sliders_grid.addWidget(QLabel("Tamaño del tirador:"), 2, 0)
-        sliders_grid.addWidget(handle_control, 2, 1, 1, 2)
-
-        self.preview_slider = QSlider(Qt.Orientation.Horizontal)
-        self.preview_slider.setObjectName("previewSlider")
-        self.preview_slider.setRange(0, 100)
-        self.preview_slider.setValue(65)
-        sliders_grid.addWidget(QLabel("Vista previa:"), 3, 0)
-        sliders_grid.addWidget(self.preview_slider, 3, 1, 1, 2)
-
-        root.addWidget(sliders_group)
-
-        # --- Botones de encendido -----------------------------------------
-        toggle_group = QGroupBox("Botones de encendido")
-        toggle_grid = QGridLayout(toggle_group)
-        toggle_grid.setContentsMargins(12, 18, 12, 12)
-        toggle_grid.setHorizontalSpacing(10)
-        toggle_grid.setVerticalSpacing(8)
-        toggle_grid.setColumnStretch(1, 1)
-
         self._toggle_colors = {
-            key: QColor(settings["toggle"][key]) for key in ("on", "off", "knob")
+            key: QColor(settings["toggle"][key]) for key in ("off", "knob")
         }
         self.toggle_swatches = {}
         self.toggle_hex_labels = {}
         for row, (key, text) in enumerate(
             (
-                ("on", "Encendido:"),
-                ("off", "Apagado:"),
-                ("knob", "Perilla:"),
-            )
+                ("off", "Color de apagado:"),
+                ("knob", "Color del tirador y perilla:"),
+            ),
+            start=1,
         ):
             swatch = QPushButton()
             swatch.setObjectName("colorSwatch")
@@ -1667,10 +2114,48 @@ class SettingsDialog(QDialog):
             )
             self.toggle_swatches[key] = swatch
             self.toggle_hex_labels[key] = hex_label
-            toggle_grid.addWidget(QLabel(text), row, 0)
-            toggle_grid.addWidget(
+            controls_grid.addWidget(QLabel(text), row, 0)
+            controls_grid.addWidget(
                 self._color_control(swatch, hex_label), row, 1, 1, 2
             )
+
+        (
+            self.thickness_slider,
+            self.thickness_value,
+            thickness_control,
+        ) = self._make_slider_row(
+            SLIDER_THICKNESS_MIN,
+            SLIDER_THICKNESS_MAX,
+            settings["sliders"]["thickness"],
+            step=2,
+        )
+        controls_grid.addWidget(QLabel("Grosor de la barra:"), 3, 0)
+        controls_grid.addWidget(thickness_control, 3, 1, 1, 2)
+
+        (
+            self.handle_slider,
+            self.handle_value,
+            handle_control,
+        ) = self._make_slider_row(
+            SLIDER_HANDLE_MIN,
+            SLIDER_HANDLE_MAX,
+            settings["sliders"]["handle"],
+            step=2,
+        )
+        controls_grid.addWidget(QLabel("Tamaño del tirador y perilla:"), 4, 0)
+        controls_grid.addWidget(handle_control, 4, 1, 1, 2)
+
+        # Vista previa combinada: slider y los dos estados del switch.
+        preview_box = QWidget()
+        preview_layout = QVBoxLayout(preview_box)
+        preview_layout.setContentsMargins(0, 2, 0, 2)
+        preview_layout.setSpacing(8)
+
+        self.preview_slider = ImprovedSlider(Qt.Orientation.Horizontal)
+        self.preview_slider.setObjectName("previewSlider")
+        self.preview_slider.setRange(0, 100)
+        self.preview_slider.setValue(65)
+        preview_layout.addWidget(self.preview_slider)
 
         preview_toggle_row = QWidget()
         preview_toggle_layout = QHBoxLayout(preview_toggle_row)
@@ -1682,10 +2167,25 @@ class SettingsDialog(QDialog):
         preview_toggle_layout.addWidget(self.toggle_preview_on)
         preview_toggle_layout.addWidget(self.toggle_preview_off)
         preview_toggle_layout.addStretch(1)
-        toggle_grid.addWidget(QLabel("Vista previa:"), 3, 0)
-        toggle_grid.addWidget(preview_toggle_row, 3, 1, 1, 2)
+        preview_layout.addWidget(preview_toggle_row)
 
-        root.addWidget(toggle_group)
+        controls_grid.addWidget(QLabel("Vista previa:"), 5, 0)
+        controls_grid.addWidget(preview_box, 5, 1, 1, 2)
+
+        self.toggle_hint = QLabel(
+            "Estos ajustes se aplican a la vez a los sliders y a los botones: "
+            "el acento es el color de encendido, el apagado también pinta el "
+            "riel de la barra y la perilla del botón mide lo mismo que el "
+            "tirador del slider. La barra de los dos controles envuelve "
+            "siempre al tirador con 2 px de aire, así el tirador del slider "
+            "queda adentro igual que la perilla del botón (el grosor mínimo "
+            "efectivo es el tirador + 4 px)."
+        )
+        self.toggle_hint.setObjectName("hintLabel")
+        self.toggle_hint.setWordWrap(True)
+        controls_grid.addWidget(self.toggle_hint, 6, 0, 1, 3)
+
+        root.addWidget(controls_group)
 
         # --- Botones ------------------------------------------------------
         buttons = QHBoxLayout()
@@ -1713,7 +2213,7 @@ class SettingsDialog(QDialog):
         return container
 
     @staticmethod
-    def _make_slider_row(minimum, maximum, value):
+    def _make_slider_row(minimum, maximum, value, step=1):
         container = QWidget()
         row = QHBoxLayout(container)
         row.setContentsMargins(0, 0, 0, 0)
@@ -1721,6 +2221,10 @@ class SettingsDialog(QDialog):
 
         slider = QSlider(Qt.Orientation.Horizontal)
         slider.setRange(minimum, maximum)
+        slider.setSingleStep(step)
+        slider.setPageStep(step * 2)
+        # Los valores guardados ya vienen pares; el paso par mantiene el
+        # tirador redondo también al mover con el teclado.
         slider.setValue(value)
 
         label = QLabel()
@@ -1766,9 +2270,20 @@ class SettingsDialog(QDialog):
         self.accent_hex.setText(self._accent_color.name().upper())
         for key, label in self.toggle_hex_labels.items():
             label.setText(self._toggle_colors[key].name().upper())
-        # Los toggles ya creados (popup y vista previa) comparten la paleta.
-        ModernToggle.set_colors(
-            {key: color.name() for key, color in self._toggle_colors.items()}
+        # Un solo juego de valores para todos los controles: acento, apagado,
+        # perilla, grosor y tamaño se aplican a sliders y switches por igual.
+        ModernToggle.apply_appearance(
+            {
+                "sliders": {
+                    "thickness": self.thickness_slider.value(),
+                    "handle": self.handle_slider.value(),
+                },
+                "toggle": {
+                    "on": self._accent_color.name(),
+                    "off": self._toggle_colors["off"].name(),
+                    "knob": self._toggle_colors["knob"].name(),
+                },
+            }
         )
         opacity = self.opacity_slider.value()
         self.opacity_value.setText(f"{round(opacity / 255 * 100)}%")
@@ -1776,35 +2291,28 @@ class SettingsDialog(QDialog):
         self.thickness_value.setText(f"{self.thickness_slider.value()} px")
         self.handle_value.setText(f"{self.handle_slider.value()} px")
 
-        self._update_preview_slider_style()
+        self._update_preview_slider_appearance()
+        self._preview_timer.start()
+
+    def _emit_preview(self):
         self.preview.emit(self.get_settings())
 
-    def _update_preview_slider_style(self):
-        thickness = self.thickness_slider.value()
-        handle = self.handle_slider.value()
-        margin = (thickness - handle) / 2
-        self.preview_slider.setStyleSheet(
-            f"""
-            QSlider#previewSlider {{ min-height: {handle + 4}px; }}
-            QSlider#previewSlider::groove:horizontal {{
-                border: none;
-                height: {thickness}px;
-                background: rgba(255, 255, 255, 0.12);
-                border-radius: {thickness / 2:.1f}px;
-            }}
-            QSlider#previewSlider::sub-page:horizontal {{
-                background: {self._accent_color.name()};
-                border-radius: {thickness / 2:.1f}px;
-            }}
-            QSlider#previewSlider::handle:horizontal {{
-                background: #FFFFFF;
-                border: none;
-                width: {handle}px;
-                height: {handle}px;
-                margin: {margin}px 0;
-                border-radius: {handle / 2:.1f}px;
-            }}
-            """
+    def _update_preview_slider_appearance(self):
+        # La misma clase y el mismo dibujo que los sliders reales: la vista
+        # previa muestra exactamente cómo va a quedar, incluidos los colores
+        # compartidos con el switch.
+        self.preview_slider.apply_appearance(
+            {
+                "sliders": {
+                    "accent": self._accent_color.name(),
+                    "thickness": self.thickness_slider.value(),
+                    "handle": self.handle_slider.value(),
+                },
+                "toggle": {
+                    "off": self._toggle_colors["off"].name(),
+                    "knob": self._toggle_colors["knob"].name(),
+                },
+            }
         )
 
     def _update_swatch(self, button, color):
@@ -1827,18 +2335,18 @@ class SettingsDialog(QDialog):
 
     def _pick_accent(self):
         color = QColorDialog.getColor(
-            self._accent_color, self, "Color de acento de los sliders"
+            self._accent_color, self, "Color de acento (sliders y botones)"
         )
         if color.isValid():
             self._accent_color = color
             self._update_swatch(self.accent_swatch, color)
+            self._apply_dialog_style()
             self._refresh_state()
 
     def _pick_toggle_color(self, key):
         titles = {
-            "on": "Color del botón encendido",
-            "off": "Color del botón apagado",
-            "knob": "Color de la perilla",
+            "off": "Color de apagado (botón y riel del slider)",
+            "knob": "Color del tirador y la perilla",
         }
         color = QColorDialog.getColor(
             self._toggle_colors[key], self, titles.get(key, "Color del botón")
@@ -1864,12 +2372,13 @@ class SettingsDialog(QDialog):
         self._tint_color = QColor(defaults["glass"]["tint"])
         self._accent_color = QColor(defaults["sliders"]["accent"])
         self._toggle_colors = {
-            key: QColor(defaults["toggle"][key]) for key in ("on", "off", "knob")
+            key: QColor(defaults["toggle"][key]) for key in ("off", "knob")
         }
         self._update_swatch(self.tint_swatch, self._tint_color)
         self._update_swatch(self.accent_swatch, self._accent_color)
         for key, swatch in self.toggle_swatches.items():
             self._update_swatch(swatch, self._toggle_colors[key])
+        self._apply_dialog_style()
 
         self.enabled_check.setChecked(defaults["glass"]["enabled"])
         index = self.mode_combo.findData(defaults["glass"]["mode"])
@@ -1900,21 +2409,33 @@ class SettingsDialog(QDialog):
                     "handle": self.handle_slider.value(),
                 },
                 "toggle": {
-                    key: color.name()
-                    for key, color in self._toggle_colors.items()
+                    **{
+                        key: color.name()
+                        for key, color in self._toggle_colors.items()
+                    },
+                    # Se guarda también "on" para que el JSON siga siendo
+                    # autoexplicativo, pero siempre igual al acento.
+                    "on": self._accent_color.name(),
                 },
             }
         )
 
+    def accept(self):
+        # No dejar pendiente una vista previa que podría aplicarse después de
+        # cerrar el diálogo.
+        self._preview_timer.stop()
+        super().accept()
+
     def reject(self):
         # Al cancelar, la vista previa vuelve a como estaba antes de abrir.
+        self._preview_timer.stop()
         self.preview.emit(copy.deepcopy(self._original))
         super().reject()
 
     # -- estilo ------------------------------------------------------------
 
     def _apply_dialog_style(self):
-        self.setStyleSheet(
+        style = (
             """
             QDialog {
                 background-color: #232323;
@@ -1967,6 +2488,9 @@ class SettingsDialog(QDialog):
                 border: 1px solid rgba(255, 255, 255, 0.16);
                 selection-background-color: #005FB8;
             }
+            QSlider {
+                min-height: 16px;
+            }
             QSlider::groove:horizontal {
                 border: none;
                 height: 4px;
@@ -1974,7 +2498,7 @@ class SettingsDialog(QDialog):
                 border-radius: 2px;
             }
             QSlider::sub-page:horizontal {
-                background: #005FB8;
+                background: %ACCENT%;
                 border-radius: 2px;
             }
             QSlider::handle:horizontal {
@@ -2009,6 +2533,7 @@ class SettingsDialog(QDialog):
             }
             """
         )
+        self.setStyleSheet(style.replace("%ACCENT%", self._accent_color.name()))
 
 
 class PopupWindow(QWidget):
@@ -2035,13 +2560,21 @@ class PopupWindow(QWidget):
         self._backdrop = None
         self._backdrop_offset = QPoint(0, 0)
         self.settings = load_settings()
-        ModernToggle.set_colors(self.settings["toggle"])
+        ModernToggle.apply_appearance(self.settings)
         self._tint_color = QColor(self.settings["glass"]["tint"])
         self._tint_color.setAlpha(self.settings["glass"]["opacity"])
 
         self.blur_timer = QTimer(self)
         self.blur_timer.setInterval(150)
         self.blur_timer.timeout.connect(self.refresh_backdrop)
+
+        # Recargar la lista una sola vez por ráfaga de lámparas encontradas:
+        # antes se reconstruía toda la interfaz por cada lámpara.
+        self._reload_timer = QTimer(self)
+        self._reload_timer.setSingleShot(True)
+        self._reload_timer.setInterval(150)
+        self._reload_timer.timeout.connect(self.load_content)
+        self._found_count = 0
 
         self.setWindowTitle("WiZ Control")
         self.setWindowFlags(
@@ -2086,13 +2619,22 @@ class PopupWindow(QWidget):
         tint = QColor(self.settings["glass"]["tint"])
         tint.setAlpha(self.settings["glass"]["opacity"])
         self._tint_color = tint
-        # La paleta de los toggles se comparte con todos los controles.
-        ModernToggle.set_colors(self.settings["toggle"])
-        # Solo se regenera el QSS si cambiaron los sliders; el tinte y la
-        # opacidad se repintan solos.
-        if previous["sliders"] != self.settings["sliders"]:
-            self.apply_styles()
-        if previous["glass"] != self.settings["glass"]:
+        # Los colores y las medidas se comparten con todos los controles.
+        ModernToggle.apply_appearance(self.settings)
+        # Cambiar cualquier ajuste de controles (color, grosor o tirador)
+        # repinta los sliders: usan los mismos valores que el switch.
+        if (
+            previous["sliders"] != self.settings["sliders"]
+            or previous["toggle"] != self.settings["toggle"]
+        ):
+            self.apply_slider_appearance()
+        # El tinte y la opacidad se repintan en paintEvent: NO hace falta
+        # recapturar la pantalla ni re-aplicar el blur de Windows mientras se
+        # arrastra el slider de opacidad.
+        if (
+            previous["glass"]["enabled"] != self.settings["glass"]["enabled"]
+            or previous["glass"]["mode"] != self.settings["glass"]["mode"]
+        ):
             self.enable_frosted_glass()
         else:
             self.update()
@@ -2229,6 +2771,21 @@ class PopupWindow(QWidget):
         margin_y = int(win_rect.height() * 0.10)
         return win_rect.adjusted(-margin_x, -margin_y, margin_x, margin_y)
 
+    def slider_interaction_started(self):
+        """Mientras se arrastra un slider, el panel no se cierra solo.
+
+        Antes, si el arrastre se iba un poco fuera del panel, el temporizador
+        de auto-cierre lo ocultaba en medio de la interacción."""
+        self.hide_timer.stop()
+        if self.check_timer.isActive():
+            self.check_timer.stop()
+
+    def slider_interaction_finished(self):
+        if self._auto_hide_paused or not self.isVisible():
+            return
+        if not self.get_detection_rect().contains(QCursor.pos()):
+            self.hide_timer.start()
+
     def pause_auto_hide(self):
         """Frena cualquier cierre automático mientras haya un diálogo hijo abierto"""
         self._auto_hide_paused = True
@@ -2362,15 +2919,6 @@ class PopupWindow(QWidget):
         self.apply_styles()
 
     def apply_styles(self):
-        sliders = self.settings["sliders"]
-        accent = sliders["accent"]
-        thickness = sliders["thickness"]
-        handle = sliders["handle"]
-        color_height = thickness + 2
-        # El margen se centra respecto del surco: así el tirador conserva
-        # siempre su diámetro y queda redondo aunque sea más chico que la barra.
-        handle_margin = (thickness - handle) / 2
-        color_margin = (color_height - handle) / 2
         self.setStyleSheet(
             """
             QWidget {
@@ -2437,13 +2985,10 @@ class PopupWindow(QWidget):
                 color: #A0A0A0;
                 font-size: 10px;
             }
-            QSlider#colorSlider::groove:horizontal {
-                background: qlineargradient(x1:0, y1:0, x2:1, y2:0,
-                    stop:0 #FF0000, stop:0.17 #FFFF00, stop:0.33 #00FF00,
-                    stop:0.5 #00FFFF, stop:0.67 #0000FF, stop:0.83 #FF00FF, stop:1 #FF0000);
-            }
-            QSlider#colorSlider::sub-page:horizontal {
-                background: transparent;
+            QLabel#emptyState {
+                color: #9A9A9A;
+                font-size: 12px;
+                padding: 28px 10px;
             }
             QScrollArea {
                 background-color: transparent;
@@ -2461,41 +3006,18 @@ class PopupWindow(QWidget):
                 margin: 2px;
             }
             """
-            # Los sliders son personalizables: estos valores salen del JSON.
-            + f"""
-            QSlider {{
-                min-height: {handle + 4}px;
-            }}
-            QSlider::groove:horizontal {{
-                border: none;
-                height: {thickness}px;
-                background: rgba(255, 255, 255, 0.1);
-                border-radius: {thickness / 2:.1f}px;
-            }}
-            QSlider::handle:horizontal {{
-                background: #FFFFFF;
-                border: none;
-                width: {handle}px;
-                height: {handle}px;
-                margin: {handle_margin}px 0;
-                border-radius: {handle / 2:.1f}px;
-            }}
-            QSlider::sub-page:horizontal {{
-                background: {accent};
-                border-radius: {thickness / 2:.1f}px;
-            }}
-            QSlider#colorSlider::groove:horizontal {{
-                height: {color_height}px;
-                border-radius: {color_height / 2:.1f}px;
-            }}
-            QSlider#colorSlider::handle:horizontal {{
-                width: {handle}px;
-                height: {handle}px;
-                margin: {color_margin}px 0;
-                border-radius: {handle / 2:.1f}px;
-            }}
-            """
         )
+        self.apply_slider_appearance()
+
+    def apply_slider_appearance(self):
+        """Aplica la apariencia a cada slider (dibujo propio, barato).
+
+        Así la vista previa de los ajustes solo actualiza los sliders en lugar
+        de repasar todo el árbol de controles del popup."""
+        for slider in self.findChildren(ImprovedSlider):
+            slider.apply_appearance(
+                self.settings, gradient=slider.objectName() == "colorSlider"
+            )
 
     def load_content(self):
         """Carga grupos y lámparas no agrupadas"""
@@ -2523,6 +3045,23 @@ class PopupWindow(QWidget):
                     self.content_layout.count() - 1, lamp_widget
                 )
 
+        # Estado vacío: sin lámparas ni grupos el panel quedaba en blanco sin
+        # explicar qué hacer.
+        if not self.wiz_manager.get_lamps() and not self.wiz_manager.get_groups():
+            empty = QLabel(
+                "No hay luces todavía.\n"
+                "Usá «Descubrir» para buscar las de tu red WiZ."
+            )
+            empty.setObjectName("emptyState")
+            empty.setAlignment(Qt.AlignmentFlag.AlignCenter)
+            empty.setWordWrap(True)
+            self.content_layout.insertWidget(
+                self.content_layout.count() - 1, empty
+            )
+
+        # Los sliders recién creados todavía no tienen apariencia.
+        self.apply_slider_appearance()
+
     def handle_delete_lamp(self, mac):
         self.wiz_manager.delete_lamp(mac)
         self.load_content()
@@ -2539,6 +3078,7 @@ class PopupWindow(QWidget):
     def start_discovery(self):
         self.discover_button.setEnabled(False)
         self.discover_button.setText("Buscando...")
+        self._found_count = 0
         self.discovery_thread = DiscoveryThread()
         self.discovery_thread.lamp_found.connect(self.handle_lamp_found)
         self.discovery_thread.finished.connect(self.discovery_finished)
@@ -2549,12 +3089,30 @@ class PopupWindow(QWidget):
         if mac and self.wiz_manager.add_lamp(
             mac, lamp_data.get("ip"), lamp_data.get("name")
         ):
-            self.load_content()
+            self._found_count += 1
+            # Si aparecen varias lámparas seguidas, se refresca una sola vez.
+            self._reload_timer.start()
 
     def discovery_finished(self):
-        QMessageBox.information(self, "Descubrimiento", "Búsqueda finalizada.")
+        self._reload_timer.stop()
+        self.load_content()
         self.discover_button.setEnabled(True)
         self.discover_button.setText("Descubrir")
+        count = self._found_count
+        if count:
+            QMessageBox.information(
+                self,
+                "Descubrimiento",
+                f"Búsqueda finalizada.\n"
+                f"{count} {'lámpara nueva' if count == 1 else 'lámparas nuevas'}.",
+            )
+        else:
+            QMessageBox.information(
+                self,
+                "Descubrimiento",
+                "Búsqueda finalizada. No se encontraron lámparas nuevas.",
+            )
+        self._found_count = 0
 
     def show_at_position(self, position: QPoint):
         x = position.x() - self.width() - 10
@@ -2570,6 +3128,8 @@ class TrayAppQt:
         self.app = QApplication(sys.argv)
         self.app.setQuitOnLastWindowClosed(False)
         self.wiz_manager = WizManager()
+        # Guardar lo pendiente (brillo, color, temperatura) al salir.
+        self.app.aboutToQuit.connect(self.wiz_manager.shutdown)
 
         # Tipografía: Windows 11 trae Segoe UI Variable, con mejor espaciado
         # y legibilidad que Segoe UI. Si no está, se usa la clásica.
