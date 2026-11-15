@@ -178,9 +178,11 @@ function Install-Winwiz {
     $InstallDir = [Environment]::ExpandEnvironmentVariables($InstallDir)
 
     Write-Host ""
-    Write-Host "  WINWIZ - $AppTitle" -ForegroundColor Cyan
-    Write-Host "  Instalador para Windows" -ForegroundColor DarkGray
-    Write-Host ""
+    if (-not $Quiet) {
+        Write-Host "  WINWIZ - $AppTitle" -ForegroundColor Cyan
+        Write-Host "  Instalador para Windows" -ForegroundColor DarkGray
+        Write-Host ""
+    }
 
     if ($DryRun) {
         Write-Host "  Modo de prueba: no se descarga ni se modifica nada." -ForegroundColor Yellow
@@ -364,24 +366,26 @@ cd /d "%~dp0"
     ) | Set-Content -LiteralPath (Join-Path $InstallDir "install-info.txt") -Encoding UTF8
 
     # -- Listo ---------------------------------------------------------------
-    Write-Host ""
-    Write-Host "  WINWIZ se instalo correctamente." -ForegroundColor Green
-    Write-Host "  Carpeta: $InstallDir" -ForegroundColor Gray
-    Write-Host "  Datos:   $DataDir" -ForegroundColor Gray
-    if ($startMenuCreated) {
-        Write-Host "  Acceso:  Menu Inicio > WINWIZ" -ForegroundColor Gray
+    if (-not $Quiet) {
+        Write-Host ""
+        Write-Host "  WINWIZ se instalo correctamente." -ForegroundColor Green
+        Write-Host "  Carpeta: $InstallDir" -ForegroundColor Gray
+        Write-Host "  Datos:   $DataDir" -ForegroundColor Gray
+        if ($startMenuCreated) {
+            Write-Host "  Acceso:  Menu Inicio > WINWIZ" -ForegroundColor Gray
+        }
+        if (-not $NoDesktopShortcut) {
+            Write-Host "           Escritorio > WINWIZ" -ForegroundColor Gray
+        }
+        Write-Host ""
+        if (-not $NoRegistry) {
+            Write-Host "  Para desinstalar: Configuracion > Aplicaciones > WINWIZ" -ForegroundColor DarkGray
+            Write-Host "  o ejecuta el comando de desinstalacion del README." -ForegroundColor DarkGray
+        } else {
+            Write-Host "  Para desinstalar: ejecuta uninstall.ps1 de $InstallDir" -ForegroundColor DarkGray
+        }
+        Write-Host ""
     }
-    if (-not $NoDesktopShortcut) {
-        Write-Host "           Escritorio > WINWIZ" -ForegroundColor Gray
-    }
-    Write-Host ""
-    if (-not $NoRegistry) {
-        Write-Host "  Para desinstalar: Configuracion > Aplicaciones > WINWIZ" -ForegroundColor DarkGray
-        Write-Host "  o ejecuta el comando de desinstalacion del README." -ForegroundColor DarkGray
-    } else {
-        Write-Host "  Para desinstalar: ejecuta uninstall.ps1 de $InstallDir" -ForegroundColor DarkGray
-    }
-    Write-Host ""
 
     if (-not $NoLaunch -and -not $Quiet) {
         Start-Process -FilePath $venvPythonw -ArgumentList "`"$mainPy`"" -WorkingDirectory $InstallDir
