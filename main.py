@@ -37,6 +37,7 @@ from PyQt6.QtGui import (
     QAction,
     QCursor,
     QColor,
+    QPalette,
     QFont,
     QFontDatabase,
     QPainter,
@@ -234,6 +235,429 @@ def save_settings(settings):
             json.dump(settings, f, indent=4)
     except OSError:
         pass
+
+
+# ---------------------------------------------------------------------------
+# Tema compartido por todas las ventanas y diálogos
+# ---------------------------------------------------------------------------
+# El panel principal es una ventana sin marco con vidrio esmerilado; los
+# diálogos nativos (ajustes, crear grupo, selectores de color, mensajes)
+# quedaban con el tema claro de Windows y desentonaban por completo. Abajo
+# hay una única hoja de estilos y una clase base que aplican el mismo fondo
+# oscuro, el mismo acento y el mismo redondeo a todas las ventanas.
+
+ACCENT_FALLBACK = DEFAULT_SETTINGS["sliders"]["accent"]
+
+
+def accent_color(settings=None):
+    """Devuelve el color de acento actual como ``QColor``.
+
+    Acepta los ajustes completos, un nombre de color o directamente un
+    ``QColor``. Si no se pasa nada se leen los ajustes guardados en disco.
+    Cualquier valor inválido cae en el acento por defecto.
+    """
+    if settings is None:
+        settings = load_settings()
+    if isinstance(settings, QColor):
+        return QColor(settings) if settings.isValid() else QColor(ACCENT_FALLBACK)
+    if isinstance(settings, str):
+        color = QColor(settings)
+        return color if color.isValid() else QColor(ACCENT_FALLBACK)
+    try:
+        color = QColor(settings["sliders"]["accent"])
+    except (KeyError, TypeError):
+        color = QColor(ACCENT_FALLBACK)
+    return color if color.isValid() else QColor(ACCENT_FALLBACK)
+
+
+def current_accent(parent=None):
+    """Acento de la ventana que abre un diálogo (o el guardado en disco)."""
+    window = parent.window() if isinstance(parent, QWidget) else parent
+    settings = getattr(window, "settings", None) if window is not None else None
+    return accent_color(settings)
+
+
+def dialog_stylesheet(accent=None):
+    """Hoja de estilos común para diálogos, menús y cuadros de mensaje.
+
+    Se mantiene en un solo lugar para que cualquier ventana nueva herede el
+    mismo tema sin repetir colores ni medidas.
+    """
+    accent_name = accent_color(accent).name()
+    accent = QColor(accent_name)
+    style = """
+        QDialog, QMessageBox {
+            background-color: #232323;
+        }
+        QLabel {
+            color: #E8E8E8;
+            font-size: 12px;
+        }
+        QLabel#dialogTitle {
+            color: #FFFFFF;
+            font-size: 15px;
+            font-weight: 600;
+        }
+        QLabel#settingValue {
+            color: #B8B8B8;
+            font-size: 11px;
+        }
+        QLabel#hintLabel {
+            color: #9A9A9A;
+            font-size: 11px;
+        }
+        QGroupBox {
+            border: 1px solid rgba(255, 255, 255, 0.14);
+            border-radius: 6px;
+            margin-top: 12px;
+            padding-top: 6px;
+            font-size: 12px;
+            font-weight: 600;
+            color: #FFFFFF;
+        }
+        QGroupBox::title {
+            subcontrol-origin: margin;
+            left: 10px;
+            padding: 0 4px;
+        }
+        QCheckBox {
+            color: #E8E8E8;
+            font-size: 12px;
+            spacing: 7px;
+        }
+        QCheckBox::indicator {
+            width: 15px;
+            height: 15px;
+            border: 1px solid rgba(255, 255, 255, 0.32);
+            border-radius: 4px;
+            background-color: rgba(255, 255, 255, 0.06);
+        }
+        QCheckBox::indicator:hover {
+            border-color: rgba(255, 255, 255, 0.55);
+        }
+        QCheckBox::indicator:checked {
+            background-color: %ACCENT%;
+            border-color: %ACCENT%;
+        }
+        QComboBox {
+            background-color: #2E2E2E;
+            border: 1px solid rgba(255, 255, 255, 0.16);
+            border-radius: 4px;
+            padding: 4px 8px;
+            color: #FFFFFF;
+        }
+        QComboBox:hover, QComboBox:focus {
+            border-color: %ACCENT%;
+        }
+        QComboBox::drop-down {
+            border: none;
+            width: 18px;
+        }
+        QComboBox QAbstractItemView {
+            background-color: #2E2E2E;
+            color: #FFFFFF;
+            border: 1px solid rgba(255, 255, 255, 0.16);
+            selection-background-color: %ACCENT%;
+            outline: none;
+        }
+        QLineEdit {
+            background-color: #2E2E2E;
+            border: 1px solid rgba(255, 255, 255, 0.16);
+            border-radius: 4px;
+            padding: 6px 8px;
+            color: #FFFFFF;
+            selection-background-color: %ACCENT%;
+        }
+        QLineEdit:focus {
+            border-color: %ACCENT%;
+        }
+        QListWidget {
+            background-color: rgba(255, 255, 255, 0.05);
+            border: 1px solid rgba(255, 255, 255, 0.14);
+            border-radius: 6px;
+            padding: 4px;
+            color: #E8E8E8;
+            outline: none;
+        }
+        QListWidget::item {
+            padding: 5px 6px;
+            border-radius: 4px;
+        }
+        QListWidget::item:hover {
+            background-color: rgba(255, 255, 255, 0.08);
+        }
+        QListWidget::item:selected {
+            background-color: %ACCENT%;
+            color: #FFFFFF;
+        }
+        QListWidget::indicator, QListView::indicator {
+            width: 14px;
+            height: 14px;
+            border: 1px solid rgba(255, 255, 255, 0.32);
+            border-radius: 3px;
+            background-color: rgba(255, 255, 255, 0.06);
+        }
+        QListWidget::indicator:checked, QListView::indicator:checked {
+            background-color: %ACCENT%;
+            border-color: %ACCENT%;
+        }
+        QSpinBox {
+            background-color: #2E2E2E;
+            border: 1px solid rgba(255, 255, 255, 0.16);
+            border-radius: 4px;
+            padding: 3px 6px;
+            color: #FFFFFF;
+            selection-background-color: %ACCENT%;
+        }
+        QSlider {
+            min-height: 16px;
+        }
+        QSlider::groove:horizontal {
+            border: none;
+            height: 4px;
+            background: rgba(255, 255, 255, 0.15);
+            border-radius: 2px;
+        }
+        QSlider::sub-page:horizontal {
+            background: %ACCENT%;
+            border-radius: 2px;
+        }
+        QSlider::handle:horizontal {
+            background: #FFFFFF;
+            border: none;
+            width: 12px;
+            height: 12px;
+            margin: -4px 0;
+            border-radius: 6px;
+        }
+        QPushButton {
+            background-color: rgba(255, 255, 255, 0.10);
+            border: 1px solid rgba(255, 255, 255, 0.16);
+            border-radius: 4px;
+            padding: 6px 14px;
+            color: #FFFFFF;
+            font-size: 12px;
+        }
+        QPushButton:hover {
+            background-color: rgba(255, 255, 255, 0.17);
+        }
+        QPushButton:pressed {
+            background-color: rgba(255, 255, 255, 0.24);
+        }
+        QPushButton#primaryButton {
+            background-color: %ACCENT%;
+            border: none;
+            font-weight: 600;
+        }
+        QPushButton#primaryButton:hover {
+            background-color: %ACCENT_HOVER%;
+        }
+        QPushButton#primaryButton:pressed {
+            background-color: %ACCENT_PRESSED%;
+        }
+        QPushButton:disabled {
+            color: rgba(255, 255, 255, 0.35);
+        }
+        QScrollBar:vertical {
+            background: transparent;
+            width: 10px;
+            margin: 2px;
+        }
+        QScrollBar::handle:vertical {
+            background: rgba(255, 255, 255, 0.22);
+            min-height: 24px;
+            border-radius: 4px;
+        }
+        QScrollBar::add-line:vertical, QScrollBar::sub-line:vertical {
+            height: 0px;
+        }
+        QScrollBar::add-page:vertical, QScrollBar::sub-page:vertical {
+            background: transparent;
+        }
+        QMenu {
+            background-color: #2A2A2A;
+            border: 1px solid rgba(255, 255, 255, 0.16);
+            border-radius: 6px;
+            padding: 4px;
+        }
+        QMenu::item {
+            padding: 6px 22px 6px 14px;
+            border-radius: 4px;
+            color: #E8E8E8;
+        }
+        QMenu::item:selected {
+            background-color: %ACCENT%;
+            color: #FFFFFF;
+        }
+        QMenu::separator {
+            height: 1px;
+            background: rgba(255, 255, 255, 0.12);
+            margin: 4px 8px;
+        }
+        QToolTip {
+            background-color: #2A2A2A;
+            color: #E8E8E8;
+            border: 1px solid rgba(255, 255, 255, 0.18);
+            padding: 4px 6px;
+        }
+    """
+    return (
+        style.replace("%ACCENT%", accent_name)
+        .replace("%ACCENT_HOVER%", accent.lighter(118).name())
+        .replace("%ACCENT_PRESSED%", accent.darker(112).name())
+    )
+
+
+def apply_dark_palette(widget, accent=None):
+    """Paleta oscura para los controles que se pintan por fuera de Qt.
+
+    ``QColorDialog`` dibuja varios selectores con su propia paleta; sin esto
+    quedarían con fondo claro aunque la hoja de estilos sea oscura.
+    """
+    palette = widget.palette()
+    accent = accent_color(accent)
+    palette.setColor(QPalette.ColorRole.Window, QColor("#232323"))
+    palette.setColor(QPalette.ColorRole.WindowText, QColor("#E8E8E8"))
+    palette.setColor(QPalette.ColorRole.Base, QColor("#2E2E2E"))
+    palette.setColor(QPalette.ColorRole.AlternateBase, QColor("#2A2A2A"))
+    palette.setColor(QPalette.ColorRole.Text, QColor("#FFFFFF"))
+    palette.setColor(QPalette.ColorRole.Button, QColor("#2E2E2E"))
+    palette.setColor(QPalette.ColorRole.ButtonText, QColor("#E8E8E8"))
+    palette.setColor(QPalette.ColorRole.Highlight, accent)
+    palette.setColor(QPalette.ColorRole.HighlightedText, QColor("#FFFFFF"))
+    palette.setColor(QPalette.ColorRole.ToolTipBase, QColor("#2A2A2A"))
+    palette.setColor(QPalette.ColorRole.ToolTipText, QColor("#E8E8E8"))
+    widget.setPalette(palette)
+    return palette
+
+
+_DWMWA_USE_IMMERSIVE_DARK_MODE = 20
+_DWMWA_USE_IMMERSIVE_DARK_MODE_LEGACY = 19
+
+
+def apply_dark_title_bar(window):
+    """Pinta la barra de título nativa de Windows en modo oscuro.
+
+    Se prueban las dos versiones del atributo porque cambió de número entre
+    builds de Windows 10 y 11. Si el sistema no lo soporta no pasa nada: el
+    contenido del diálogo ya está oscuro.
+    """
+    if sys.platform != "win32":
+        return False
+    try:
+        hwnd = int(window.winId())
+        enabled = ctypes.c_int(1)
+        for attribute in (
+            _DWMWA_USE_IMMERSIVE_DARK_MODE,
+            _DWMWA_USE_IMMERSIVE_DARK_MODE_LEGACY,
+        ):
+            result = ctypes.windll.dwmapi.DwmSetWindowAttribute(
+                ctypes.c_void_p(hwnd),
+                attribute,
+                ctypes.byref(enabled),
+                ctypes.sizeof(enabled),
+            )
+            if result == 0:
+                _set_round_corners(hwnd)
+                return True
+    except Exception:
+        pass
+    return False
+
+
+class AppDialog(QDialog):
+    """Base de todos los diálogos: tema oscuro y siempre por encima.
+
+    El panel principal es una ventana «tool» marcada como siempre visible.
+    Un diálogo modal común podía quedar detrás de otra ventana y, como
+    bloquea la interacción con el panel, parecía que la app se había colgado.
+    Con ``WindowStaysOnTopHint`` y un ``raise_()`` al mostrarse, el diálogo
+    queda siempre al frente y deja claro por qué el panel no responde.
+    """
+
+    def __init__(self, parent=None, accent=None):
+        super().__init__(parent)
+        self.setWindowFlag(Qt.WindowType.WindowStaysOnTopHint, True)
+        self._accent = accent_color(accent)
+        self.apply_theme(self._accent)
+
+    def apply_theme(self, accent=None):
+        """Aplica la hoja de estilos compartida con un acento opcional."""
+        if accent is not None:
+            self._accent = accent_color(accent)
+        self.setStyleSheet(dialog_stylesheet(self._accent))
+
+    def showEvent(self, event):
+        super().showEvent(event)
+        # El handle nativo recién existe después de crear la ventana.
+        apply_dark_title_bar(self)
+        self.raise_()
+        self.activateWindow()
+
+
+def pick_color(parent, color, title):
+    """Abre un selector de color no nativo, oscuro y siempre al frente."""
+    dialog = QColorDialog(color, parent)
+    dialog.setWindowTitle(title)
+    dialog.setOption(QColorDialog.ColorDialogOption.DontUseNativeDialog, True)
+    dialog.setWindowFlag(Qt.WindowType.WindowStaysOnTopHint, True)
+    accent = current_accent(parent)
+    apply_dark_palette(dialog, accent)
+    dialog.setStyleSheet(dialog_stylesheet(accent))
+    apply_dark_title_bar(dialog)
+    if dialog.exec() == QDialog.DialogCode.Accepted:
+        return dialog.selectedColor()
+    return QColor()
+
+
+def show_message(
+    parent,
+    icon,
+    title,
+    text,
+    buttons=QMessageBox.StandardButton.Ok,
+    default=None,
+):
+    """Muestra un ``QMessageBox`` con el tema de la app y siempre arriba."""
+    box = QMessageBox(parent)
+    box.setIcon(icon)
+    box.setWindowTitle(title)
+    box.setText(text)
+    box.setStandardButtons(buttons)
+    if default is not None:
+        box.setDefaultButton(default)
+    box.setWindowFlag(Qt.WindowType.WindowStaysOnTopHint, True)
+    accent = current_accent(parent)
+    apply_dark_palette(box, accent)
+    box.setStyleSheet(dialog_stylesheet(accent))
+    apply_dark_title_bar(box)
+    return box.exec()
+
+
+def ask_confirmation(parent, title, text):
+    """Pregunta Sí/No con el tema de la app; devuelve True si acepta."""
+    reply = show_message(
+        parent,
+        QMessageBox.Icon.Question,
+        title,
+        text,
+        QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+        default=QMessageBox.StandardButton.No,
+    )
+    return reply == QMessageBox.StandardButton.Yes
+
+
+def show_warning(parent, title, text):
+    show_message(parent, QMessageBox.Icon.Warning, title, text)
+
+
+def show_information(parent, title, text):
+    show_message(parent, QMessageBox.Icon.Information, title, text)
+
+
+def apply_menu_theme(menu, accent=None):
+    """Aplica el tema oscuro a un ``QMenu`` (por ejemplo el de la bandeja)."""
+    menu.setStyleSheet(dialog_stylesheet(accent))
 
 
 # ---------------------------------------------------------------------------
@@ -1461,7 +1885,7 @@ class LampControl(QWidget):
         if hasattr(popup, "pause_auto_hide"):
             popup.pause_auto_hide()
 
-        color = QColorDialog.getColor(self.current_color, self, "Elegir color exacto")
+        color = pick_color(self, self.current_color, "Elegir color exacto")
 
         if hasattr(popup, "resume_auto_hide"):
             popup.resume_auto_hide()
@@ -1498,13 +1922,11 @@ class LampControl(QWidget):
         self.wiz_manager.send_command(self.ip, command)
 
     def confirm_delete(self):
-        reply = QMessageBox.question(
+        if ask_confirmation(
             self,
             "Borrar lámpara",
             f"¿Seguro que querés borrar '{self.name}'?",
-            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
-        )
-        if reply == QMessageBox.StandardButton.Yes:
+        ):
             self.delete_requested.emit(self.mac)
 
 
@@ -1854,7 +2276,7 @@ class GroupControl(QWidget):
         if hasattr(popup, "pause_auto_hide"):
             popup.pause_auto_hide()
 
-        color = QColorDialog.getColor(self.current_color, self, "Elegir color exacto")
+        color = pick_color(self, self.current_color, "Elegir color exacto")
 
         if hasattr(popup, "resume_auto_hide"):
             popup.resume_auto_hide()
@@ -1902,53 +2324,73 @@ class GroupControl(QWidget):
             )
 
     def confirm_delete(self):
-        reply = QMessageBox.question(
+        if ask_confirmation(
             self,
             "Borrar grupo",
             f"¿Seguro que querés borrar el grupo '{self.group_name}'?\n"
             "Las lámparas no se borran, quedan sueltas.",
-            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
-        )
-        if reply == QMessageBox.StandardButton.Yes:
+        ):
             self.delete_requested.emit(self.group_name)
 
 
-class GroupDialog(QDialog):
+class GroupDialog(AppDialog):
+    """Diálogo para crear un grupo, con el mismo tema que el panel."""
+
     def __init__(self, wiz_manager, parent=None):
-        super().__init__(parent)
+        super().__init__(parent, accent=current_accent(parent))
         self.wiz_manager = wiz_manager
-        self.setWindowTitle("Crear Grupo")
+        self.setWindowTitle("Crear grupo")
         self.setModal(True)
-        self.resize(300, 400)
+        self.setMinimumWidth(340)
+        self.resize(340, 430)
 
-        layout = QVBoxLayout(self)
+        root = QVBoxLayout(self)
+        root.setContentsMargins(16, 14, 16, 14)
+        root.setSpacing(10)
 
-        layout.addWidget(QLabel("Nombre del grupo:"))
+        title = QLabel("Nuevo grupo")
+        title.setObjectName("dialogTitle")
+        root.addWidget(title)
+
+        subtitle = QLabel(
+            "Elegí un nombre y marcá las luces que forman parte del grupo."
+        )
+        subtitle.setObjectName("hintLabel")
+        subtitle.setWordWrap(True)
+        root.addWidget(subtitle)
+
+        root.addWidget(QLabel("Nombre del grupo:"))
         self.group_name_input = QLineEdit()
-        layout.addWidget(self.group_name_input)
+        self.group_name_input.setPlaceholderText("Ej.: Living")
+        self.group_name_input.setClearButtonEnabled(True)
+        root.addWidget(self.group_name_input)
 
-        layout.addWidget(QLabel("Seleccionar luces:"))
+        root.addWidget(QLabel("Seleccionar luces:"))
         self.lamp_list = QListWidget()
         for lamp in self.wiz_manager.get_lamps():
             item = QListWidgetItem(lamp["name"])
             item.setData(Qt.ItemDataRole.UserRole, lamp["mac"])
             item.setCheckState(Qt.CheckState.Unchecked)
             self.lamp_list.addItem(item)
-        layout.addWidget(self.lamp_list)
+        root.addWidget(self.lamp_list, 1)
 
         btn_layout = QHBoxLayout()
-        save_btn = QPushButton("Guardar")
+        btn_layout.setSpacing(8)
         cancel_btn = QPushButton("Cancelar")
+        save_btn = QPushButton("Guardar")
+        save_btn.setObjectName("primaryButton")
+        save_btn.setDefault(True)
         save_btn.clicked.connect(self.save_group)
         cancel_btn.clicked.connect(self.reject)
-        btn_layout.addWidget(save_btn)
+        btn_layout.addStretch(1)
         btn_layout.addWidget(cancel_btn)
-        layout.addLayout(btn_layout)
+        btn_layout.addWidget(save_btn)
+        root.addLayout(btn_layout)
 
     def save_group(self):
         group_name = self.group_name_input.text().strip()
         if not group_name:
-            QMessageBox.warning(self, "Error", "Ingresa un nombre para el grupo")
+            show_warning(self, "Error", "Ingresá un nombre para el grupo")
             return
 
         selected_macs = []
@@ -1958,14 +2400,14 @@ class GroupDialog(QDialog):
                 selected_macs.append(item.data(Qt.ItemDataRole.UserRole))
 
         if not selected_macs:
-            QMessageBox.warning(self, "Error", "Selecciona al menos una luz")
+            show_warning(self, "Error", "Seleccioná al menos una luz")
             return
 
         self.wiz_manager.add_group(group_name, selected_macs)
         self.accept()
 
 
-class SettingsDialog(QDialog):
+class SettingsDialog(AppDialog):
     """Ajustes de apariencia con vista previa en vivo.
 
     Cada cambio emite ``preview`` con una copia de los ajustes; el popup los
@@ -1975,7 +2417,7 @@ class SettingsDialog(QDialog):
     preview = pyqtSignal(object)
 
     def __init__(self, settings, parent=None):
-        super().__init__(parent)
+        super().__init__(parent, accent=settings["sliders"]["accent"])
         self._original = copy.deepcopy(settings)
         self._tint_color = QColor(settings["glass"]["tint"])
         self._accent_color = QColor(settings["sliders"]["accent"])
@@ -2325,8 +2767,8 @@ class SettingsDialog(QDialog):
         )
 
     def _pick_tint(self):
-        color = QColorDialog.getColor(
-            self._tint_color, self, "Color del tinte del vidrio"
+        color = pick_color(
+            self, self._tint_color, "Color del tinte del vidrio"
         )
         if color.isValid():
             self._tint_color = color
@@ -2334,8 +2776,8 @@ class SettingsDialog(QDialog):
             self._refresh_state()
 
     def _pick_accent(self):
-        color = QColorDialog.getColor(
-            self._accent_color, self, "Color de acento (sliders y botones)"
+        color = pick_color(
+            self, self._accent_color, "Color de acento (sliders y botones)"
         )
         if color.isValid():
             self._accent_color = color
@@ -2348,8 +2790,10 @@ class SettingsDialog(QDialog):
             "off": "Color de apagado (botón y riel del slider)",
             "knob": "Color del tirador y la perilla",
         }
-        color = QColorDialog.getColor(
-            self._toggle_colors[key], self, titles.get(key, "Color del botón")
+        color = pick_color(
+            self,
+            self._toggle_colors[key],
+            titles.get(key, "Color del botón"),
         )
         if color.isValid():
             self._toggle_colors[key] = color
@@ -2435,108 +2879,15 @@ class SettingsDialog(QDialog):
     # -- estilo ------------------------------------------------------------
 
     def _apply_dialog_style(self):
-        style = (
-            """
-            QDialog {
-                background-color: #232323;
-            }
-            QLabel {
-                color: #E8E8E8;
-                font-size: 12px;
-            }
-            QLabel#settingValue {
-                color: #B8B8B8;
-                font-size: 11px;
-            }
-            QLabel#hintLabel {
-                color: #9A9A9A;
-                font-size: 11px;
-            }
-            QGroupBox {
-                border: 1px solid rgba(255, 255, 255, 0.14);
-                border-radius: 6px;
-                margin-top: 12px;
-                padding-top: 6px;
-                font-size: 12px;
-                font-weight: 600;
-                color: #FFFFFF;
-            }
-            QGroupBox::title {
-                subcontrol-origin: margin;
-                left: 10px;
-                padding: 0 4px;
-            }
-            QCheckBox {
-                color: #E8E8E8;
-                font-size: 12px;
-                spacing: 7px;
-            }
-            QComboBox {
-                background-color: #2E2E2E;
-                border: 1px solid rgba(255, 255, 255, 0.16);
-                border-radius: 4px;
-                padding: 4px 8px;
-                color: #FFFFFF;
-            }
-            QComboBox::drop-down {
-                border: none;
-                width: 18px;
-            }
-            QComboBox QAbstractItemView {
-                background-color: #2E2E2E;
-                color: #FFFFFF;
-                border: 1px solid rgba(255, 255, 255, 0.16);
-                selection-background-color: #005FB8;
-            }
-            QSlider {
-                min-height: 16px;
-            }
-            QSlider::groove:horizontal {
-                border: none;
-                height: 4px;
-                background: rgba(255, 255, 255, 0.15);
-                border-radius: 2px;
-            }
-            QSlider::sub-page:horizontal {
-                background: %ACCENT%;
-                border-radius: 2px;
-            }
-            QSlider::handle:horizontal {
-                background: #FFFFFF;
-                border: none;
-                width: 12px;
-                height: 12px;
-                margin: -4px 0;
-                border-radius: 6px;
-            }
-            QPushButton {
-                background-color: rgba(255, 255, 255, 0.10);
-                border: 1px solid rgba(255, 255, 255, 0.16);
-                border-radius: 4px;
-                padding: 6px 14px;
-                color: #FFFFFF;
-                font-size: 12px;
-            }
-            QPushButton:hover {
-                background-color: rgba(255, 255, 255, 0.17);
-            }
-            QPushButton#primaryButton {
-                background-color: #005FB8;
-                border: none;
-                font-weight: 600;
-            }
-            QPushButton#primaryButton:hover {
-                background-color: #0A6FD0;
-            }
-            QPushButton:disabled {
-                color: rgba(255, 255, 255, 0.35);
-            }
-            """
-        )
-        self.setStyleSheet(style.replace("%ACCENT%", self._accent_color.name()))
+        # Una sola hoja de estilos para todas las ventanas de la app. Se
+        # reaplica al cambiar el acento para que la selección, el foco y el
+        # botón principal sigan el color elegido.
+        self.apply_theme(self._accent_color)
 
 
 class PopupWindow(QWidget):
+    appearance_changed = pyqtSignal(object)
+
     def __init__(self, wiz_manager):
         super().__init__()
         self.wiz_manager = wiz_manager
@@ -2638,6 +2989,11 @@ class PopupWindow(QWidget):
             self.enable_frosted_glass()
         else:
             self.update()
+        # El menú de la bandeja también sigue el acento elegido.
+        if previous["sliders"].get("accent") != self.settings["sliders"].get(
+            "accent"
+        ):
+            self.appearance_changed.emit(self.settings)
 
     def open_settings(self):
         """Abre el diálogo de ajustes con vista previa en vivo."""
@@ -3071,8 +3427,15 @@ class PopupWindow(QWidget):
         self.load_content()
 
     def create_group(self):
-        dialog = GroupDialog(self.wiz_manager, self)
-        if dialog.exec() == QDialog.DialogCode.Accepted:
+        # Mientras el diálogo modal está abierto, el panel no debe cerrarse
+        # solo: si se ocultara, el diálogo quedaría huérfano.
+        self.pause_auto_hide()
+        try:
+            dialog = GroupDialog(self.wiz_manager, self)
+            accepted = dialog.exec() == QDialog.DialogCode.Accepted
+        finally:
+            self.resume_auto_hide()
+        if accepted:
             self.load_content()
 
     def start_discovery(self):
@@ -3099,19 +3462,23 @@ class PopupWindow(QWidget):
         self.discover_button.setEnabled(True)
         self.discover_button.setText("Descubrir")
         count = self._found_count
-        if count:
-            QMessageBox.information(
-                self,
-                "Descubrimiento",
-                f"Búsqueda finalizada.\n"
-                f"{count} {'lámpara nueva' if count == 1 else 'lámparas nuevas'}.",
-            )
-        else:
-            QMessageBox.information(
-                self,
-                "Descubrimiento",
-                "Búsqueda finalizada. No se encontraron lámparas nuevas.",
-            )
+        self.pause_auto_hide()
+        try:
+            if count:
+                show_information(
+                    self,
+                    "Descubrimiento",
+                    f"Búsqueda finalizada.\n"
+                    f"{count} {'lámpara nueva' if count == 1 else 'lámparas nuevas'}.",
+                )
+            else:
+                show_information(
+                    self,
+                    "Descubrimiento",
+                    "Búsqueda finalizada. No se encontraron lámparas nuevas.",
+                )
+        finally:
+            self.resume_auto_hide()
         self._found_count = 0
 
     def show_at_position(self, position: QPoint):
@@ -3152,23 +3519,30 @@ class TrayAppQt:
         icon = QIcon(icon_pixmap)
         self.icon = QSystemTrayIcon(icon)
 
-        # Crear menú contextual
-        menu = QMenu()
-        show_action = QAction("Mostrar Control", menu)
-        exit_action = QAction("Salir", menu)
-        menu.addAction(show_action)
-        menu.addAction(exit_action)
-        self.icon.setContextMenu(menu)
+        # Crear menú contextual. El tema se aplica después de crear la
+        # ventana, cuando ya se conoce el acento guardado.
+        self.menu = QMenu()
+        show_action = QAction("Mostrar control", self.menu)
+        exit_action = QAction("Salir", self.menu)
+        self.menu.addAction(show_action)
+        self.menu.addAction(exit_action)
+        self.icon.setContextMenu(self.menu)
 
         # Mostrar ícono
         self.icon.setVisible(True)
 
         self.window = PopupWindow(self.wiz_manager)
+        self._apply_menu_theme(self.window.settings)
+        self.window.appearance_changed.connect(self._apply_menu_theme)
 
         # Conexiones
         self.icon.activated.connect(self.handle_icon_click)
         show_action.triggered.connect(self.show_window)
         exit_action.triggered.connect(self.app.quit)
+
+    def _apply_menu_theme(self, settings):
+        """Mantiene el menú de la bandeja igual de oscuro que el resto."""
+        apply_menu_theme(self.menu, accent_color(settings))
 
     def handle_icon_click(self, reason):
         if reason == QSystemTrayIcon.ActivationReason.Trigger:
