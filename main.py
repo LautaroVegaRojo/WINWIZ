@@ -4,6 +4,8 @@ import socket
 import os
 import copy
 import ctypes
+import ipaddress
+import threading
 from PyQt6.QtWidgets import (
     QApplication,
     QWidget,
@@ -64,10 +66,19 @@ from PyQt6.QtCore import (
     QRectF,
     QEvent,
 )
+from PyQt6.QtNetwork import QAbstractSocket, QNetworkInterface
 import time
 
 TEMP_MIN = 2200
 TEMP_MAX = 6500
+
+
+def _debug(message):
+    """Diagnóstico por stderr sin romper el build sin consola."""
+    try:
+        print(message, file=sys.stderr)
+    except Exception:
+        pass
 
 
 def resource_path(relative_path):
@@ -619,19 +630,29 @@ def show_message(
     default=None,
 ):
     """Muestra un ``QMessageBox`` con el tema de la app y siempre arriba."""
-    box = QMessageBox(parent)
-    box.setIcon(icon)
-    box.setWindowTitle(title)
-    box.setText(text)
-    box.setStandardButtons(buttons)
-    if default is not None:
-        box.setDefaultButton(default)
-    box.setWindowFlag(Qt.WindowType.WindowStaysOnTopHint, True)
-    accent = current_accent(parent)
-    apply_dark_palette(box, accent)
-    box.setStyleSheet(dialog_stylesheet(accent))
-    apply_dark_title_bar(box)
-    return box.exec()
+    # Mientras el cuadro está abierto el panel no debe cerrarse solo.
+    window = parent.window() if isinstance(parent, QWidget) else None
+    pause = getattr(window, "pause_auto_hide", None)
+    resume = getattr(window, "resume_auto_hide", None)
+    if pause:
+        pause()
+    try:
+        box = QMessageBox(parent)
+        box.setIcon(icon)
+        box.setWindowTitle(title)
+        box.setText(text)
+        box.setStandardButtons(buttons)
+        if default is not None:
+            box.setDefaultButton(default)
+        box.setWindowFlag(Qt.WindowType.WindowStaysOnTopHint, True)
+        accent = current_accent(parent)
+        apply_dark_palette(box, accent)
+        box.setStyleSheet(dialog_stylesheet(accent))
+        apply_dark_title_bar(box)
+        return box.exec()
+    finally:
+        if resume:
+            resume()
 
 
 def ask_confirmation(parent, title, text):
@@ -800,45 +821,265 @@ def blur_pixmap(pixmap, radius):
     return QPixmap.fromImage(image)
 
 
+def discovery_broadcast_targets():
+    """Direcciones donde buscar lámparas.
+
+    ``255.255.255.255`` no siempre sale por la interfaz correcta (VPN, varias
+    placas de red) y algunos routers no reenvían el broadcast limitado. Por
+    eso también se prueba el broadcast dirigido de cada red IPv4 local.
+    """
+    targets = ["255.255.255.255"]
+    try:
+        interfaces = QNetworkInterface.allInterfaces()
+    except Exception:
+        return targets
+
+    for interface in interfaces:
+        flags = interface.flags()
+        if not flags & QNetworkInterface.InterfaceFlag.IsUp:
+            continue
+        if not flags & QNetworkInterface.InterfaceFlag.IsRunning:
+            continue
+        if flags & QNetworkInterface.InterfaceFlag.IsLoopBack:
+            continue
+        if not flags & QNetworkInterface.InterfaceFlag.CanBroadcast:
+            continue
+
+        for entry in interface.addressEntries():
+            address = entry.ip()
+            if address.protocol() != QAbstractSocket.NetworkLayerProtocol.IPv4Protocol:
+                continue
+            try:
+                iface = ipaddress.IPv4Interface(
+                    f"{address.toString()}/{entry.netmask().toString()}"
+                )
+            except ValueError:
+                continue
+            if iface.ip.is_loopback or iface.ip.is_link_local:
+                continue
+            broadcast = str(iface.network.broadcast_address)
+            if broadcast not in targets:
+                targets.append(broadcast)
+
+    return targets
+
+
+def parse_discovery_response(data, ip):
+    """Valida una respuesta de ``getSystemConfig``.
+
+    Devuelve los datos de la lámpara o ``None`` si el paquete no sirve. Se
+    mantiene fuera del hilo para poder probarlo sin red.
+    """
+    try:
+        response = json.loads(data.decode("utf-8"))
+    except (UnicodeDecodeError, json.JSONDecodeError):
+        return None
+    if not isinstance(response, dict):
+        return None
+
+    result = response.get("result")
+    if not isinstance(result, dict):
+        return None
+
+    mac = result.get("mac")
+    if not isinstance(mac, str) or not mac or not ip:
+        return None
+
+    cleaned_mac = mac.replace(":", "").replace("-", "")
+    model = result.get("moduleName")
+    firmware = result.get("fwVersion")
+    rssi = result.get("rssi")
+    return {
+        "ip": ip,
+        "mac": mac,
+        "name": f"WiZ-{cleaned_mac[-6:]}",
+        "model": model if isinstance(model, str) else None,
+        "firmware": firmware if isinstance(firmware, str) else None,
+        "rssi": rssi if isinstance(rssi, int) else None,
+    }
+
+
 class DiscoveryThread(QThread):
+    """Busca lámparas WiZ por broadcast UDP.
+
+    El broadcast se repite varias veces: un solo paquete puede perderse (WiFi
+    congestionada, routers que limitan broadcast) y la lámpara quedaba sin
+    descubrir. La ventana de escucha es más larga que los envíos para dar
+    tiempo a las lámparas que contestan lento.
+
+    También acepta una lista de destinos para el "agregar por IP", donde solo
+    se consulta una dirección concreta.
+    """
+
     lamp_found = pyqtSignal(dict)
+    error = pyqtSignal(str)
+
+    UDP_PORT = 38899
+    BROADCAST_IP = "255.255.255.255"
+    DISCOVERY_MESSAGE = b'{"method":"getSystemConfig","params":{}}'
+    MAX_PACKET = 4096
+    ATTEMPTS = 5
+    SEND_INTERVAL = 0.4
+    LISTEN_TIME = 8.0
+    RECV_TIMEOUT = 0.25
+
+    def __init__(self, targets=None, listen_time=None, attempts=None, parent=None):
+        super().__init__(parent)
+        self._targets = list(targets) if targets else None
+        self._listen_time = (
+            listen_time if listen_time is not None else self.LISTEN_TIME
+        )
+        self._attempts = attempts if attempts is not None else self.ATTEMPTS
 
     def run(self):
-        UDP_PORT = 38899
-        BROADCAST_IP = "255.255.255.255"
-        DISCOVERY_MESSAGE = '{"method":"getSystemConfig","params":{}}'.encode("utf-8")
-
-        sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-        sock.setsockopt(socket.SOL_SOCKET, socket.SO_BROADCAST, 1)
-        sock.settimeout(1)
-
-        discovered_macs = set()
-        start_time = time.time()
+        targets = self._targets or discovery_broadcast_targets()
+        _debug(f"Descubrimiento: probando {', '.join(targets)}")
 
         try:
-            sock.sendto(DISCOVERY_MESSAGE, (BROADCAST_IP, UDP_PORT))
+            sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+            sock.setsockopt(socket.SOL_SOCKET, socket.SO_BROADCAST, 1)
+            # Descubrimientos seguidos reaprovechan el mismo puerto efímero
+            # sin esperar a que el sistema lo libere.
+            sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+            sock.settimeout(self.RECV_TIMEOUT)
+        except OSError as error:
+            _debug(f"Descubrimiento: no se pudo abrir el socket: {error}")
+            self.error.emit("No se pudo iniciar la búsqueda en la red.")
+            return
 
-            while time.time() - start_time < 3:
+        discovered_macs = set()
+        deadline = time.monotonic() + self._listen_time
+        next_send = time.monotonic()
+        sent = 0
+
+        try:
+            while (
+                time.monotonic() < deadline
+                and not self.isInterruptionRequested()
+            ):
+                now = time.monotonic()
+                if sent < self._attempts and now >= next_send:
+                    for target in targets:
+                        try:
+                            sock.sendto(
+                                self.DISCOVERY_MESSAGE,
+                                (target, self.UDP_PORT),
+                            )
+                        except OSError as error:
+                            _debug(
+                                "Descubrimiento: fallo al enviar a "
+                                f"{target}: {error}"
+                            )
+                    sent += 1
+                    next_send = now + self.SEND_INTERVAL
+
                 try:
-                    data, addr = sock.recvfrom(1024)
-                    try:
-                        response = json.loads(data.decode("utf-8"))
-                    except json.JSONDecodeError:
-                        continue
-                    mac = response.get("result", {}).get("mac")
-                    ip = addr[0]
-
-                    if mac and ip and mac not in discovered_macs:
-                        discovered_macs.add(mac)
-                        cleaned_mac = mac.replace(":", "")
-                        name = f"WiZ-{cleaned_mac[-6:]}"
-                        self.lamp_found.emit({"ip": ip, "mac": mac, "name": name})
+                    data, addr = sock.recvfrom(self.MAX_PACKET)
                 except socket.timeout:
-                    pass
-                except Exception:
                     continue
+                except OSError:
+                    continue
+
+                self._handle_packet(data, addr[0], discovered_macs)
         finally:
             sock.close()
+
+    def _handle_packet(self, data, ip, discovered_macs):
+        """Valida una respuesta y emite la lámpara si es nueva."""
+        lamp = parse_discovery_response(data, ip)
+        if lamp is None or lamp["mac"] in discovered_macs:
+            return
+
+        discovered_macs.add(lamp["mac"])
+        self.lamp_found.emit(lamp)
+
+
+class HeartbeatThread(QThread):
+    """Avisa cuando una lámpara deja de responder o vuelve a la red.
+
+    Los comandos son fire-and-forget: si una lámpara está desenchufada o
+    cambió de IP, la interfaz seguía mostrándola como si funcionara. Este
+    hilo consulta ``getSystemConfig`` cada ``INTERVAL_MS`` y emite el cambio
+    de estado para que la tarjeta lo refleje.
+
+    Se necesitan dos fallos seguidos para marcar "sin conexión": un paquete
+    UDP suelto se pierde con facilidad y no queremos que la tarjeta parpadee.
+    """
+
+    status_changed = pyqtSignal(str, bool)  # mac, en línea
+
+    UDP_PORT = 38899
+    QUERY = b'{"method":"getSystemConfig","params":{}}'
+    MAX_PACKET = 4096
+    INTERVAL_MS = 30000
+    TIMEOUT = 1.5
+    FAILURES_BEFORE_OFFLINE = 2
+
+    def __init__(self, wiz_manager, parent=None):
+        super().__init__(parent)
+        self.wiz_manager = wiz_manager
+        self._failures = {}
+        self._reported = {}
+
+    def run(self):
+        while not self.isInterruptionRequested():
+            self._check_lamps()
+            self._wait_next_round()
+
+    def _wait_next_round(self):
+        """Espera el intervalo en tramos cortos para poder salir rápido."""
+        remaining = self.INTERVAL_MS
+        while remaining > 0 and not self.isInterruptionRequested():
+            step = min(100, remaining)
+            self.msleep(step)
+            remaining -= step
+
+    def _check_lamps(self):
+        for mac, ip in self.wiz_manager.get_lamp_targets():
+            if self.isInterruptionRequested():
+                return
+            online = bool(ip) and ip != "0.0.0.0" and self._ping(ip)
+            self._report(mac, online)
+
+    def _ping(self, ip):
+        """True si la lámpara contestó una respuesta válida."""
+        sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        sock.settimeout(self.TIMEOUT)
+        try:
+            sock.sendto(self.QUERY, (ip, self.UDP_PORT))
+            deadline = time.monotonic() + self.TIMEOUT
+            while time.monotonic() < deadline:
+                data, addr = sock.recvfrom(self.MAX_PACKET)
+                if addr[0] != ip:
+                    # Respuesta de otra lámpara: se ignora y se sigue escuchando.
+                    continue
+                try:
+                    response = json.loads(data.decode("utf-8"))
+                except (UnicodeDecodeError, json.JSONDecodeError):
+                    continue
+                if isinstance(response, dict) and isinstance(
+                    response.get("result"), dict
+                ):
+                    return True
+            return False
+        except (socket.timeout, OSError):
+            return False
+        finally:
+            sock.close()
+
+    def _report(self, mac, online):
+        if online:
+            self._failures[mac] = 0
+        else:
+            failures = self._failures.get(mac, 0) + 1
+            self._failures[mac] = failures
+            if failures < self.FAILURES_BEFORE_OFFLINE:
+                return
+
+        if self._reported.get(mac, True) == online:
+            return
+        self._reported[mac] = online
+        self.status_changed.emit(mac, online)
 
 
 class WizManager:
@@ -848,6 +1089,11 @@ class WizManager:
         self.lamps = {}
         self.groups = {}
         self._socket = None
+        # El heartbeat lee la lista de lámparas desde otro hilo: el lock evita
+        # recorrer un diccionario que la UI está modificando.
+        self._lock = threading.Lock()
+        # Estado transitorio (no se guarda en disco): mac -> en línea.
+        self._online = {}
         # Guardar el JSON en cada movimiento del slider bloquea la interfaz
         # (acceso a disco en el hilo de la UI). Se escribe una sola vez cuando
         # el usuario deja de mover los controles.
@@ -903,38 +1149,115 @@ class WizManager:
             # Disco lleno / permisos: no se pierde la sesión en memoria.
             pass
 
-    def add_lamp(self, mac, ip, name):
-        if mac not in self.lamps:
-            self.lamps[mac] = {
-                'ip': ip if ip else "0.0.0.0",
-                'name': name if name else f"WiZ-{mac[-6:]}",
-                'mac': mac,
-                'last_brightness': 100,
-                'last_color_hex': '#ffffff',
-                'last_temp_kelvin': 2700
-            }
+    def add_lamp(self, mac, ip, name, model=None, firmware=None, rssi=None):
+        """Agrega una lámpara o actualiza la existente.
+
+        Devuelve ``"new"``, ``"updated"`` (cambió la IP) o ``None``. El nombre
+        que eligió el usuario nunca se pisa al volver a descubrir.
+        """
+        status = None
+        changed = False
+        with self._lock:
+            lamp = self.lamps.get(mac)
+            if lamp is None:
+                self.lamps[mac] = {
+                    'ip': ip if ip else "0.0.0.0",
+                    'name': name if name else f"WiZ-{mac[-6:]}",
+                    'mac': mac,
+                    'model': model or "",
+                    'firmware': firmware or "",
+                    'rssi': rssi,
+                    'last_brightness': 100,
+                    'last_color_hex': '#ffffff',
+                    'last_temp_kelvin': 2700
+                }
+                self._online[mac] = True
+                status = "new"
+                changed = True
+            else:
+                # Volvió a responder: el heartbeat pudo haberla marcado
+                # sin conexión.
+                self._online[mac] = True
+                if ip and lamp.get('ip') != ip:
+                    # La lámpara ya existe pero cambió de IP (DHCP).
+                    lamp['ip'] = ip
+                    status = "updated"
+                    changed = True
+                if model and lamp.get('model') != model:
+                    lamp['model'] = model
+                    changed = True
+                if firmware and lamp.get('firmware') != firmware:
+                    lamp['firmware'] = firmware
+                    changed = True
+                if rssi is not None and lamp.get('rssi') != rssi:
+                    lamp['rssi'] = rssi
+                    changed = True
+        # Fuera del lock: escribir el JSON no debe frenar al heartbeat.
+        if changed:
             self.save_data()
-            return True
-        else:
-            # Si la lámpara ya existe, actualizar la IP si cambió
-            if self.lamps[mac]['ip'] != ip:
-                self.lamps[mac]['ip'] = ip
-                self.save_data()
-                return True  # Retornar True para refrescar la interfaz
-        return False
+        return status
 
     def add_group(self, group_name, lamp_macs):
         self.groups[group_name] = lamp_macs
         self.save_data()
 
+    def rename_lamp(self, mac, new_name):
+        """Cambia el nombre visible de una lámpara."""
+        new_name = (new_name or "").strip()
+        if not new_name:
+            return False
+        with self._lock:
+            lamp = self.lamps.get(mac)
+            if lamp is None or lamp.get("name") == new_name:
+                return False
+            lamp["name"] = new_name
+        self.save_data()
+        return True
+
+    def rename_group(self, old_name, new_name):
+        """Renombra un grupo conservando el orden y sus lámparas.
+
+        El nombre es la clave del diccionario, así que hay que reconstruirlo.
+        """
+        new_name = (new_name or "").strip()
+        if not new_name or old_name not in self.groups:
+            return False
+        if new_name == old_name:
+            return False
+        # Evita dos grupos que solo difieran en mayúsculas/minúsculas.
+        taken = {
+            name.casefold()
+            for name in self.groups
+            if name != old_name
+        }
+        if new_name.casefold() in taken:
+            return False
+        self.groups = {
+            (new_name if name == old_name else name): macs
+            for name, macs in self.groups.items()
+        }
+        self.save_data()
+        return True
+
+    def group_name_exists(self, name, ignore=None):
+        """True si ya hay un grupo con ese nombre (sin distinguir mayúsculas)."""
+        target = (name or "").strip().casefold()
+        return any(
+            group.casefold() == target and group != ignore
+            for group in self.groups
+        )
+
     def delete_lamp(self, mac):
         """Borra una lámpara y la saca de cualquier grupo donde estuviera"""
-        if mac in self.lamps:
+        with self._lock:
+            if mac not in self.lamps:
+                return
             del self.lamps[mac]
             for lamp_macs in self.groups.values():
                 if mac in lamp_macs:
                     lamp_macs.remove(mac)
-            self.save_data()
+            self._online.pop(mac, None)
+        self.save_data()
 
     def delete_group(self, group_name):
         """Borra un grupo. Las lámparas del grupo NO se borran, quedan sueltas"""
@@ -980,20 +1303,43 @@ class WizManager:
 
         return [lamp for lamp in self.lamps.values() if lamp["mac"] not in grouped_macs]
 
+    def get_lamp_targets(self):
+        """Copia (mac, ip) para que el heartbeat recorra la lista sin carreras."""
+        with self._lock:
+            return [(mac, lamp.get("ip")) for mac, lamp in self.lamps.items()]
+
+    def is_online(self, mac):
+        return self._online.get(mac, True)
+
+    def set_online(self, mac, online):
+        """Marca el estado de red de una lámpara. True si cambió."""
+        with self._lock:
+            if mac not in self.lamps:
+                return False
+            changed = self._online.get(mac, True) != online
+            self._online[mac] = online
+            return changed
+
     def send_command(self, ip, command_params):
         """Envía un comando UDP reutilizando un único socket.
 
         Crear y cerrar un socket por comando era costoso al arrastrar un
         slider (varios comandos por segundo); reutilizarlo mantiene el
-        movimiento fluido."""
+        movimiento fluido.
+
+        Sigue siendo fire-and-forget a propósito: bloquear la UI esperando el
+        ACK de cada comando congelaría el arrastre del slider. La lámpara que
+        no responde se detecta con ``HeartbeatThread``.
+        """
         sock = self._get_socket()
         if sock is None:
             return
         try:
             command_json = json.dumps(command_params).encode("utf-8")
             sock.sendto(command_json, (ip, 38899))
-        except OSError:
+        except OSError as error:
             # El socket quedó inservible: se descarta y se recrea al próximo.
+            _debug(f"No se pudo enviar el comando a {ip}: {error}")
             self._close_socket()
 
     def _get_socket(self):
@@ -1652,6 +1998,10 @@ class LampControl(QWidget):
         self.mac = lamp_data["mac"]
         self.ip = lamp_data["ip"]
         self.name = lamp_data["name"]
+        self.model = lamp_data.get("model")
+        self.firmware = lamp_data.get("firmware")
+        self.rssi = lamp_data.get("rssi")
+        self.is_online = True
         self.wiz_manager = wiz_manager
 
         initial_brightness = lamp_data.get("last_brightness", 100)
@@ -1664,6 +2014,83 @@ class LampControl(QWidget):
 
         self.setObjectName("LampCard")
         self.setup_ui(lamp_data, initial_brightness)
+        # Refleja el estado que ya conoce el heartbeat (por si la tarjeta se
+        # crea después de que la lámpara dejó de responder).
+        self.set_online(self.wiz_manager.is_online(self.mac))
+
+    def set_online(self, online):
+        """Atenúa el nombre cuando la lámpara no responde en la red."""
+        self.is_online = online
+        self.name_label.setStyleSheet("" if online else "color: #9A9A9A;")
+        self._update_name_tooltip()
+
+    def _update_name_tooltip(self):
+        """Datos para identificar la lámpara aunque se repita el nombre."""
+        lines = [self.name, f"MAC: {self.mac}"]
+        if self.ip and self.ip != "0.0.0.0":
+            lines.append(f"IP: {self.ip}")
+        if self.model:
+            lines.append(f"Modelo: {self.model}")
+        extras = []
+        if self.firmware:
+            extras.append(f"FW {self.firmware}")
+        if self.rssi is not None:
+            extras.append(f"{self.rssi} dBm")
+        if extras:
+            lines.append(" · ".join(extras))
+        lines.append("En línea" if self.is_online else "Sin conexión")
+        lines.append("Clic derecho para renombrar")
+        self.name_label.setToolTip("\n".join(lines))
+
+    def show_context_menu(self, position):
+        menu = QMenu(self.window())
+        apply_menu_theme(menu, current_accent(self))
+        rename_action = menu.addAction("Renombrar…")
+        menu.addSeparator()
+        delete_action = menu.addAction("Eliminar")
+        source = self.sender()
+        if not isinstance(source, QWidget):
+            source = self
+        chosen = menu.exec(source.mapToGlobal(position))
+        if chosen is rename_action:
+            self.prompt_rename()
+        elif chosen is delete_action:
+            self.confirm_delete()
+
+    def prompt_rename(self):
+        """Pide un nombre nuevo y lo guarda sin reconstruir la tarjeta."""
+        popup = self.window()
+        if hasattr(popup, "pause_auto_hide"):
+            popup.pause_auto_hide()
+        try:
+            dialog = RenameDialog(
+                "Renombrar lámpara",
+                "Nombre de la lámpara:",
+                self.name,
+                popup,
+            )
+            accepted = dialog.exec() == QDialog.DialogCode.Accepted
+        finally:
+            if hasattr(popup, "resume_auto_hide"):
+                popup.resume_auto_hide()
+        if not accepted:
+            return
+
+        new_name = dialog.value()
+        if self.wiz_manager.rename_lamp(self.mac, new_name):
+            self.apply_name(new_name)
+
+    def apply_name(self, new_name):
+        """Actualiza el nombre en todas las tarjetas de la misma lámpara."""
+        window = self.window()
+        widgets = window.findChildren(LampControl) if window else []
+        if self not in widgets:
+            widgets.append(self)
+        for widget in widgets:
+            if widget is self or widget.mac == self.mac:
+                widget.name = new_name
+                widget.name_label.setText(new_name)
+                widget._update_name_tooltip()
 
     def setup_ui(self, lamp_data, initial_brightness):
         main_layout = QVBoxLayout(self)
@@ -1679,8 +2106,15 @@ class LampControl(QWidget):
 
         name_label = QLabel(lamp_data["name"])
         name_label.setObjectName("lampName")
+        self.name_label = name_label
         header_layout.addWidget(name_label)
         header_layout.addStretch()
+
+        # El clic derecho funciona en la tarjeta y en el nombre, sin cambiar
+        # el clic izquierdo que ya enciende/apaga la lámpara.
+        for widget in (self, header, name_label):
+            widget.setContextMenuPolicy(Qt.ContextMenuPolicy.CustomContextMenu)
+            widget.customContextMenuRequested.connect(self.show_context_menu)
 
         self.toggle = ModernToggle()
         self.toggle.setChecked(self.is_on)
@@ -1923,7 +2357,7 @@ class LampControl(QWidget):
 
     def confirm_delete(self):
         if ask_confirmation(
-            self,
+            self.window(),
             "Borrar lámpara",
             f"¿Seguro que querés borrar '{self.name}'?",
         ):
@@ -1935,6 +2369,7 @@ class GroupControl(QWidget):
 
     delete_requested = pyqtSignal(str)       # emite el nombre del grupo a borrar
     lamp_delete_requested = pyqtSignal(str)  # reenvía el mac de una lámpara interna
+    rename_requested = pyqtSignal(str, str)  # nombre viejo, nombre nuevo
 
     def __init__(self, group_name, wiz_manager, parent=None):
         super().__init__(parent)
@@ -1995,8 +2430,16 @@ class GroupControl(QWidget):
         name_layout.addWidget(self.folder_icon)
         name_label = QLabel(self.group_name)
         name_label.setObjectName("groupName")
+        self.name_label = name_label
+        name_label.setToolTip("Clic derecho para renombrar")
         name_layout.addWidget(name_label)
         header_layout.addWidget(name_row)
+
+        # Renombrar desde el clic derecho, sin romper el clic izquierdo que
+        # expande/colapsa el grupo.
+        for widget in (self, header, name_row, name_label):
+            widget.setContextMenuPolicy(Qt.ContextMenuPolicy.CustomContextMenu)
+            widget.customContextMenuRequested.connect(self.show_context_menu)
 
         # Contador de lámparas en formato píldora
         lamp_count = len(self.wiz_manager.get_lamps_in_group(self.group_name))
@@ -2323,9 +2766,49 @@ class GroupControl(QWidget):
                 lamp_widget.mac, color_hex=color.name()
             )
 
+    def show_context_menu(self, position):
+        menu = QMenu(self.window())
+        apply_menu_theme(menu, current_accent(self))
+        rename_action = menu.addAction("Renombrar…")
+        menu.addSeparator()
+        delete_action = menu.addAction("Eliminar")
+        source = self.sender()
+        if not isinstance(source, QWidget):
+            source = self
+        chosen = menu.exec(source.mapToGlobal(position))
+        if chosen is rename_action:
+            self.prompt_rename()
+        elif chosen is delete_action:
+            self.confirm_delete()
+
+    def prompt_rename(self):
+        """El renombre de un grupo lo aplica el panel, porque cambia su clave."""
+        popup = self.window()
+        if hasattr(popup, "pause_auto_hide"):
+            popup.pause_auto_hide()
+        try:
+            taken = [
+                name
+                for name in self.wiz_manager.get_groups()
+                if name != self.group_name
+            ]
+            dialog = RenameDialog(
+                "Renombrar grupo",
+                "Nombre del grupo:",
+                self.group_name,
+                popup,
+                taken_names=taken,
+            )
+            accepted = dialog.exec() == QDialog.DialogCode.Accepted
+        finally:
+            if hasattr(popup, "resume_auto_hide"):
+                popup.resume_auto_hide()
+        if accepted:
+            self.rename_requested.emit(self.group_name, dialog.value())
+
     def confirm_delete(self):
         if ask_confirmation(
-            self,
+            self.window(),
             "Borrar grupo",
             f"¿Seguro que querés borrar el grupo '{self.group_name}'?\n"
             "Las lámparas no se borran, quedan sueltas.",
@@ -2392,6 +2875,9 @@ class GroupDialog(AppDialog):
         if not group_name:
             show_warning(self, "Error", "Ingresá un nombre para el grupo")
             return
+        if self.wiz_manager.group_name_exists(group_name):
+            show_warning(self, "Error", "Ya existe un grupo con ese nombre")
+            return
 
         selected_macs = []
         for i in range(self.lamp_list.count()):
@@ -2405,6 +2891,155 @@ class GroupDialog(AppDialog):
 
         self.wiz_manager.add_group(group_name, selected_macs)
         self.accept()
+
+
+class RenameDialog(AppDialog):
+    """Diálogo chico para cambiar el nombre de una lámpara o un grupo."""
+
+    def __init__(self, title, label, current, parent=None, taken_names=None):
+        super().__init__(parent, accent=current_accent(parent))
+        self._taken = {name.casefold() for name in (taken_names or ())}
+        self.setWindowTitle(title)
+        self.setModal(True)
+        self.setMinimumWidth(320)
+
+        root = QVBoxLayout(self)
+        root.setContentsMargins(16, 14, 16, 14)
+        root.setSpacing(10)
+
+        title_label = QLabel(title)
+        title_label.setObjectName("dialogTitle")
+        root.addWidget(title_label)
+
+        root.addWidget(QLabel(label))
+        self.name_input = QLineEdit(current)
+        self.name_input.setMaxLength(40)
+        self.name_input.setClearButtonEnabled(True)
+        self.name_input.selectAll()
+        self.name_input.textChanged.connect(self._validate)
+        self.name_input.returnPressed.connect(self._try_accept)
+        root.addWidget(self.name_input)
+
+        self.error_label = QLabel("")
+        self.error_label.setObjectName("hintLabel")
+        self.error_label.setStyleSheet("color: #FF9A9A;")
+        self.error_label.hide()
+        root.addWidget(self.error_label)
+
+        buttons = QHBoxLayout()
+        buttons.setSpacing(8)
+        cancel_btn = QPushButton("Cancelar")
+        self.save_button = QPushButton("Guardar")
+        self.save_button.setObjectName("primaryButton")
+        self.save_button.setDefault(True)
+        self.save_button.clicked.connect(self._try_accept)
+        cancel_btn.clicked.connect(self.reject)
+        buttons.addStretch(1)
+        buttons.addWidget(cancel_btn)
+        buttons.addWidget(self.save_button)
+        root.addLayout(buttons)
+
+        self._validate()
+        self.name_input.setFocus()
+
+    def _validate(self):
+        name = self.name_input.text().strip()
+        error = ""
+        if not name:
+            error = "El nombre no puede estar vacío."
+        elif name.casefold() in self._taken:
+            error = "Ya existe otro grupo con ese nombre."
+        self.error_label.setText(error)
+        self.error_label.setVisible(bool(error))
+        self.save_button.setEnabled(not error)
+        return not error
+
+    def _try_accept(self):
+        if self._validate():
+            self.accept()
+
+    def value(self):
+        return self.name_input.text().strip()
+
+
+class AddLampDialog(AppDialog):
+    """Pide una IP concreta cuando el broadcast no llega a la lámpara."""
+
+    def __init__(self, parent=None):
+        super().__init__(parent, accent=current_accent(parent))
+        self.setWindowTitle("Agregar lámpara por IP")
+        self.setModal(True)
+        self.setMinimumWidth(340)
+
+        root = QVBoxLayout(self)
+        root.setContentsMargins(16, 14, 16, 14)
+        root.setSpacing(10)
+
+        title = QLabel("Agregar por IP")
+        title.setObjectName("dialogTitle")
+        root.addWidget(title)
+
+        hint = QLabel(
+            "Si la lámpara no aparece con «Descubrir», escribí su IP. "
+            "Podés verla en la app WiZ o en la lista de dispositivos del router."
+        )
+        hint.setObjectName("hintLabel")
+        hint.setWordWrap(True)
+        root.addWidget(hint)
+
+        root.addWidget(QLabel("IP de la lámpara:"))
+        self.ip_input = QLineEdit()
+        self.ip_input.setPlaceholderText("Ej.: 192.168.0.42")
+        self.ip_input.setClearButtonEnabled(True)
+        self.ip_input.textChanged.connect(self._validate)
+        self.ip_input.returnPressed.connect(self._try_accept)
+        root.addWidget(self.ip_input)
+
+        self.error_label = QLabel("")
+        self.error_label.setObjectName("hintLabel")
+        self.error_label.setStyleSheet("color: #FF9A9A;")
+        self.error_label.hide()
+        root.addWidget(self.error_label)
+
+        buttons = QHBoxLayout()
+        buttons.setSpacing(8)
+        cancel_btn = QPushButton("Cancelar")
+        self.search_button = QPushButton("Buscar")
+        self.search_button.setObjectName("primaryButton")
+        self.search_button.setDefault(True)
+        self.search_button.clicked.connect(self._try_accept)
+        cancel_btn.clicked.connect(self.reject)
+        buttons.addStretch(1)
+        buttons.addWidget(cancel_btn)
+        buttons.addWidget(self.search_button)
+        root.addLayout(buttons)
+
+        self.ip_input.setFocus()
+
+    def _validate(self):
+        text = self.ip_input.text().strip()
+        error = ""
+        if not text:
+            error = "Ingresá la IP de la lámpara."
+        else:
+            try:
+                address = ipaddress.ip_address(text)
+            except ValueError:
+                error = "Ingresá una IP válida, por ejemplo 192.168.0.42."
+            else:
+                if address.version != 4:
+                    error = "Por ahora solo se admiten direcciones IPv4."
+        self.error_label.setText(error)
+        self.error_label.setVisible(bool(error))
+        self.search_button.setEnabled(not error)
+        return not error
+
+    def _try_accept(self):
+        if self._validate():
+            self.accept()
+
+    def value(self):
+        return self.ip_input.text().strip()
 
 
 class SettingsDialog(AppDialog):
@@ -2925,7 +3560,36 @@ class PopupWindow(QWidget):
         self._reload_timer.setSingleShot(True)
         self._reload_timer.setInterval(150)
         self._reload_timer.timeout.connect(self.load_content)
-        self._found_count = 0
+
+        # Si hay un diálogo modal abierto no se puede reconstruir la lista:
+        # se borrarían las tarjetas detrás del diálogo. Se reintenta al cerrar.
+        self._deferred_reload_timer = QTimer(self)
+        self._deferred_reload_timer.setSingleShot(True)
+        self._deferred_reload_timer.setInterval(250)
+        self._deferred_reload_timer.timeout.connect(self.load_content)
+
+        # Estado del descubrimiento: la barra inline reemplaza al modal.
+        self._new_count = 0
+        self._updated_count = 0
+        self._discovery_cancelled = False
+        self._discovery_running = False
+        self._discovery_mode = "broadcast"
+        self._manual_ip = None
+        self._last_found_name = ""
+        self._discovery_action = None
+        self._discovery_status_base = ""
+        self._discovery_error = ""
+        self._found_total = 0
+        self.discovery_thread = None
+        self._discovery_dots = 0
+
+        self._discovery_anim_timer = QTimer(self)
+        self._discovery_anim_timer.setInterval(400)
+        self._discovery_anim_timer.timeout.connect(self._tick_discovery_status)
+
+        self._discovery_status_timer = QTimer(self)
+        self._discovery_status_timer.setSingleShot(True)
+        self._discovery_status_timer.timeout.connect(self._clear_discovery_message)
 
         self.setWindowTitle("WiZ Control")
         self.setWindowFlags(
@@ -3155,6 +3819,10 @@ class PopupWindow(QWidget):
 
     def resume_auto_hide(self):
         """Reactiva el auto-cierre al cerrarse el diálogo hijo"""
+        # Si la barra de descubrimiento sigue visible, el panel debe quedar
+        # abierto aunque el mouse se aleje.
+        if self._discovery_running:
+            return
         self._auto_hide_paused = False
         if self._glass_mode == "capture" and self.isVisible():
             self.refresh_backdrop()
@@ -3255,6 +3923,29 @@ class PopupWindow(QWidget):
 
         main_layout.addLayout(btn_row)
 
+        # Barra de estado del descubrimiento: reemplaza al modal de fin de
+        # búsqueda y queda a la vista mientras se busca.
+        self.discovery_bar = QFrame()
+        self.discovery_bar.setObjectName("discoveryBar")
+        bar_layout = QHBoxLayout(self.discovery_bar)
+        bar_layout.setContentsMargins(10, 6, 6, 6)
+        bar_layout.setSpacing(8)
+
+        self.discovery_status = QLabel("")
+        self.discovery_status.setObjectName("discoveryStatus")
+        self.discovery_status.setWordWrap(True)
+        bar_layout.addWidget(self.discovery_status, 1)
+
+        self.discovery_action = QPushButton("")
+        self.discovery_action.setObjectName("discoveryAction")
+        self.discovery_action.setCursor(Qt.CursorShape.PointingHandCursor)
+        self.discovery_action.clicked.connect(self._run_discovery_action)
+        self.discovery_action.hide()
+        bar_layout.addWidget(self.discovery_action)
+
+        self.discovery_bar.hide()
+        main_layout.addWidget(self.discovery_bar)
+
         # Área de scroll
         self.scroll_area = QScrollArea()
         self.scroll_area.setWidgetResizable(True)
@@ -3346,6 +4037,32 @@ class PopupWindow(QWidget):
                 font-size: 12px;
                 padding: 28px 10px;
             }
+            QFrame#discoveryBar {
+                background-color: rgba(255, 255, 255, 0.07);
+                border: 1px solid rgba(255, 255, 255, 0.10);
+                border-radius: 5px;
+            }
+            QLabel#discoveryStatus {
+                color: #D8D8D8;
+                font-size: 11px;
+            }
+            QPushButton#discoveryAction {
+                background-color: rgba(120, 170, 255, 0.18);
+                border: 1px solid rgba(120, 170, 255, 0.28);
+                border-radius: 4px;
+                color: #FFFFFF;
+                font-size: 11px;
+                font-weight: 600;
+                padding: 3px 8px;
+            }
+            QPushButton#discoveryAction:hover {
+                background-color: rgba(120, 170, 255, 0.30);
+            }
+            QPushButton#discoveryAction:disabled {
+                color: #7A7A7A;
+                background-color: rgba(255, 255, 255, 0.05);
+                border-color: rgba(255, 255, 255, 0.08);
+            }
             QScrollArea {
                 background-color: transparent;
                 border: none;
@@ -3377,6 +4094,11 @@ class PopupWindow(QWidget):
 
     def load_content(self):
         """Carga grupos y lámparas no agrupadas"""
+        if QApplication.activeModalWidget() is not None:
+            # Reconstruir ahora borraría las tarjetas que sostienen al diálogo.
+            self._deferred_reload_timer.start()
+            return
+
         # Limpiar contenido
         for i in reversed(range(self.content_layout.count() - 1)):
             widget = self.content_layout.itemAt(i).widget()
@@ -3388,6 +4110,7 @@ class PopupWindow(QWidget):
             group_widget = GroupControl(group_name, self.wiz_manager)
             group_widget.delete_requested.connect(self.handle_delete_group)
             group_widget.lamp_delete_requested.connect(self.handle_delete_lamp)
+            group_widget.rename_requested.connect(self.handle_rename_group)
             self.content_layout.insertWidget(
                 self.content_layout.count() - 1, group_widget
             )
@@ -3404,13 +4127,29 @@ class PopupWindow(QWidget):
         # Estado vacío: sin lámparas ni grupos el panel quedaba en blanco sin
         # explicar qué hacer.
         if not self.wiz_manager.get_lamps() and not self.wiz_manager.get_groups():
-            empty = QLabel(
+            empty = QWidget()
+            empty_layout = QVBoxLayout(empty)
+            empty_layout.setContentsMargins(0, 0, 0, 0)
+            empty_layout.setSpacing(0)
+            empty_label = QLabel(
                 "No hay luces todavía.\n"
                 "Usá «Descubrir» para buscar las de tu red WiZ."
             )
-            empty.setObjectName("emptyState")
-            empty.setAlignment(Qt.AlignmentFlag.AlignCenter)
-            empty.setWordWrap(True)
+            empty_label.setObjectName("emptyState")
+            empty_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
+            empty_label.setWordWrap(True)
+            empty_layout.addWidget(empty_label)
+
+            add_button = QPushButton("Agregar por IP")
+            add_button.setObjectName("discoveryAction")
+            add_button.setCursor(Qt.CursorShape.PointingHandCursor)
+            add_button.setFixedHeight(24)
+            add_button.clicked.connect(self.open_add_lamp_dialog)
+            empty_layout.addWidget(
+                add_button, 0, Qt.AlignmentFlag.AlignHCenter
+            )
+            empty_layout.addSpacing(16)
+
             self.content_layout.insertWidget(
                 self.content_layout.count() - 1, empty
             )
@@ -3426,6 +4165,11 @@ class PopupWindow(QWidget):
         self.wiz_manager.delete_group(group_name)
         self.load_content()
 
+    def handle_rename_group(self, old_name, new_name):
+        """El nombre del grupo es la clave del diccionario: se recarga todo."""
+        if self.wiz_manager.rename_group(old_name, new_name):
+            self.load_content()
+
     def create_group(self):
         # Mientras el diálogo modal está abierto, el panel no debe cerrarse
         # solo: si se ocultara, el diálogo quedaría huérfano.
@@ -3439,47 +4183,257 @@ class PopupWindow(QWidget):
             self.load_content()
 
     def start_discovery(self):
-        self.discover_button.setEnabled(False)
-        self.discover_button.setText("Buscando...")
-        self._found_count = 0
-        self.discovery_thread = DiscoveryThread()
-        self.discovery_thread.lamp_found.connect(self.handle_lamp_found)
-        self.discovery_thread.finished.connect(self.discovery_finished)
-        self.discovery_thread.start()
+        """«Descubrir» inicia la búsqueda; durante la búsqueda pasa a «Cancelar»."""
+        if self._discovery_running:
+            self.cancel_discovery()
+            return
+
+        self._discovery_mode = "broadcast"
+        self._manual_ip = None
+        self._start_discovery_thread(
+            DiscoveryThread(), "Buscando lámparas en la red"
+        )
+
+    def _start_discovery_thread(self, thread, status_text):
+        self._new_count = 0
+        self._updated_count = 0
+        self._found_total = 0
+        self._last_found_name = ""
+        self._discovery_cancelled = False
+        self._discovery_error = ""
+        self._discovery_dots = 0
+        self._discovery_running = True
+
+        self.discover_button.setText("Cancelar")
+        self.discover_button.setEnabled(True)
+        # Mientras se busca, el panel no se cierra solo.
+        self.pause_auto_hide()
+
+        self._show_discovery_message(status_text)
+        self._discovery_anim_timer.start()
+
+        self.discovery_thread = thread
+        thread.lamp_found.connect(self.handle_lamp_found)
+        thread.error.connect(self._handle_discovery_error)
+        thread.finished.connect(self.discovery_finished)
+        thread.start()
+
+    def start_manual_discovery(self, ip):
+        """Consulta una IP concreta cuando el broadcast no llega."""
+        if self._discovery_running:
+            return
+        self._discovery_mode = "manual"
+        self._manual_ip = ip
+        self._start_discovery_thread(
+            DiscoveryThread(targets=[ip], attempts=4, listen_time=4.0),
+            f"Buscando {ip}",
+        )
+
+    def cancel_discovery(self):
+        thread = self.discovery_thread
+        if thread is None or not thread.isRunning():
+            return
+        self._discovery_cancelled = True
+        self._discovery_anim_timer.stop()
+        self._discovery_status_base = "Cancelando"
+        self.discovery_status.setText("Cancelando…")
+        self.discovery_action.hide()
+        thread.requestInterruption()
+
+    def _handle_discovery_error(self, message):
+        self._discovery_error = message
+
+    def _run_discovery_action(self):
+        if self._discovery_action == "manual":
+            self.open_add_lamp_dialog()
+
+    def open_add_lamp_dialog(self):
+        """Pide una IP y busca solo esa dirección."""
+        if self._discovery_running:
+            return
+        self.pause_auto_hide()
+        try:
+            dialog = AddLampDialog(self)
+            accepted = dialog.exec() == QDialog.DialogCode.Accepted
+            ip = dialog.value() if accepted else None
+        finally:
+            self.resume_auto_hide()
+        if ip:
+            self.start_manual_discovery(ip)
+
+    def _show_discovery_message(
+        self, text, action=None, action_text="", timeout=None
+    ):
+        self._discovery_status_base = text
+        self.discovery_status.setText(text)
+        self._discovery_action = action
+        if action and action_text:
+            self.discovery_action.setText(action_text)
+            self.discovery_action.show()
+        else:
+            self.discovery_action.hide()
+        self.discovery_bar.show()
+        self._discovery_status_timer.stop()
+        if timeout is not None:
+            self._discovery_status_timer.start(timeout)
+
+    def _tick_discovery_status(self):
+        if not self._discovery_running:
+            self._discovery_anim_timer.stop()
+            return
+        self._discovery_dots = (self._discovery_dots + 1) % 4
+        dots = "." * self._discovery_dots
+        self.discovery_status.setText(
+            f"{self._discovery_status_base}{dots}"
+        )
+
+    def _update_discovery_progress(self):
+        """Muestra cuántas lámparas van apareciendo mientras se busca."""
+        total = self._new_count + self._updated_count
+        if self._discovery_mode == "manual":
+            base = f"Buscando {self._manual_ip}"
+        else:
+            base = "Buscando lámparas"
+        if total:
+            found = "encontrada" if total == 1 else "encontradas"
+            base = f"{base}: {total} {found}"
+        self._discovery_status_base = base
+        dots = "." * self._discovery_dots
+        self.discovery_status.setText(f"{base}{dots}")
+
+    def _clear_discovery_message(self):
+        if self._discovery_running:
+            return
+        self.discovery_bar.hide()
+        self._discovery_action = None
+        self._discovery_status_base = ""
+
+    def _discovery_summary(self):
+        parts = []
+        if self._new_count:
+            parts.append(
+                f"{self._new_count} "
+                f"{'nueva' if self._new_count == 1 else 'nuevas'}"
+            )
+        if self._updated_count:
+            parts.append(
+                f"{self._updated_count} "
+                f"{'actualizada' if self._updated_count == 1 else 'actualizadas'}"
+            )
+        return " y ".join(parts)
 
     def handle_lamp_found(self, lamp_data):
         mac = lamp_data.get("mac")
-        if mac and self.wiz_manager.add_lamp(
-            mac, lamp_data.get("ip"), lamp_data.get("name")
-        ):
-            self._found_count += 1
+        if not mac:
+            return
+
+        status = self.wiz_manager.add_lamp(
+            mac,
+            lamp_data.get("ip"),
+            lamp_data.get("name"),
+            model=lamp_data.get("model"),
+            firmware=lamp_data.get("firmware"),
+            rssi=lamp_data.get("rssi"),
+        )
+        self._found_total += 1
+        self._last_found_name = lamp_data.get("name") or mac
+
+        if status == "new":
+            self._new_count += 1
+        elif status == "updated":
+            self._updated_count += 1
+        if status is not None:
             # Si aparecen varias lámparas seguidas, se refresca una sola vez.
             self._reload_timer.start()
 
+        # add_lamp ya la marcó en línea; force refresca la tarjeta si estaba
+        # atenuada por el heartbeat.
+        self.handle_lamp_status(mac, True, force=True)
+
+        if self._discovery_running:
+            self._update_discovery_progress()
+
+    def handle_lamp_status(self, mac, online, force=False):
+        """Aplica el resultado del heartbeat a todas las tarjetas de esa lámpara."""
+        changed = self.wiz_manager.set_online(mac, online)
+        if not changed and not force:
+            return
+        for widget in self.findChildren(LampControl):
+            if widget.mac == mac:
+                widget.set_online(online)
+
     def discovery_finished(self):
+        self._discovery_anim_timer.stop()
         self._reload_timer.stop()
-        self.load_content()
-        self.discover_button.setEnabled(True)
+        thread = self.discovery_thread
+        self.discovery_thread = None
+        if thread is not None:
+            thread.deleteLater()
+        self._discovery_running = False
         self.discover_button.setText("Descubrir")
-        count = self._found_count
-        self.pause_auto_hide()
-        try:
-            if count:
-                show_information(
-                    self,
-                    "Descubrimiento",
-                    f"Búsqueda finalizada.\n"
-                    f"{count} {'lámpara nueva' if count == 1 else 'lámparas nuevas'}.",
+        self.discover_button.setEnabled(True)
+
+        cancelled = self._discovery_cancelled
+        error = self._discovery_error
+        mode = self._discovery_mode
+        manual_ip = self._manual_ip
+        summary = self._discovery_summary()
+        found = self._found_total > 0
+        found_total = self._found_total
+        last_name = self._last_found_name
+
+        # Volver al modo normal antes de mostrar el resultado.
+        self._discovery_mode = "broadcast"
+        self._manual_ip = None
+        self._discovery_cancelled = False
+        self._discovery_error = ""
+        self._discovery_dots = 0
+        self._new_count = 0
+        self._updated_count = 0
+        self._found_total = 0
+        self._last_found_name = ""
+
+        self.load_content()
+        # Si hay un diálogo abierto (por ejemplo, «Renombrar») no se reactiva
+        # el auto-cierre: el diálogo se cerraría junto con el panel.
+        if QApplication.activeModalWidget() is None:
+            self.resume_auto_hide()
+
+        if error:
+            self._show_discovery_message(
+                error, action="manual", action_text="Agregar por IP"
+            )
+        elif cancelled:
+            text = "Búsqueda cancelada."
+            if summary:
+                text += f" {summary}."
+            self._show_discovery_message(text, timeout=4000)
+        elif mode == "manual":
+            if found:
+                self._show_discovery_message(
+                    f"Lámpara agregada: {last_name}.", timeout=5000
                 )
             else:
-                show_information(
-                    self,
-                    "Descubrimiento",
-                    "Búsqueda finalizada. No se encontraron lámparas nuevas.",
+                self._show_discovery_message(
+                    f"La IP {manual_ip} no respondió.",
+                    action="manual",
+                    action_text="Agregar por IP",
                 )
-        finally:
-            self.resume_auto_hide()
-        self._found_count = 0
+        elif summary:
+            self._show_discovery_message(f"Listo: {summary}.", timeout=6000)
+        elif found_total:
+            if found_total == 1:
+                text = "Listo: la lámpara ya estaba agregada."
+            else:
+                text = f"Listo: {found_total} lámparas ya estaban agregadas."
+            self._show_discovery_message(text, timeout=6000)
+        else:
+            self._show_discovery_message(
+                "No se encontraron lámparas. Revisá que estén encendidas y en "
+                "la misma red.",
+                action="manual",
+                action_text="Agregar por IP",
+            )
 
     def show_at_position(self, position: QPoint):
         x = position.x() - self.width() - 10
@@ -3535,10 +4489,26 @@ class TrayAppQt:
         self._apply_menu_theme(self.window.settings)
         self.window.appearance_changed.connect(self._apply_menu_theme)
 
+        # Detecta lámparas que dejaron de responder (o que volvieron).
+        self.heartbeat = HeartbeatThread(self.wiz_manager)
+        self.heartbeat.status_changed.connect(self.window.handle_lamp_status)
+        self.heartbeat.start()
+        self.app.aboutToQuit.connect(self.shutdown)
+
         # Conexiones
         self.icon.activated.connect(self.handle_icon_click)
         show_action.triggered.connect(self.show_window)
         exit_action.triggered.connect(self.app.quit)
+
+    def shutdown(self):
+        """Corta los hilos de red antes de que muera la aplicación."""
+        self.heartbeat.requestInterruption()
+        self.heartbeat.wait(3000)
+
+        discovery = getattr(self.window, "discovery_thread", None)
+        if discovery is not None and discovery.isRunning():
+            discovery.requestInterruption()
+            discovery.wait(2000)
 
     def _apply_menu_theme(self, settings):
         """Mantiene el menú de la bandeja igual de oscuro que el resto."""
