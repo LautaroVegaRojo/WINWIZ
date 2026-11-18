@@ -15,6 +15,7 @@ tener que abrir la app oficial.
 - **Renombrar** lámparas y grupos con clic derecho, y **borrado** con confirmación.
 - Ventana flotante sin bordes, con vidrio esmerilado, que aparece al lado del cursor y se oculta sola al alejar el mouse (se pausa mientras hay un diálogo abierto, como el color picker).
 - Persistencia de lámparas y grupos entre sesiones.
+- **Actualización desde la app**: el botón de actualización (flecha circular), al lado del engranaje, revisa GitHub al iniciar, gira si hay una versión nueva y la instala con un clic.
 
 ## Requisitos
 
@@ -64,6 +65,22 @@ alguna opción, usá la forma con parámetros:
 | `-DryRun` | Muestra qué haría, sin descargar ni modificar nada. |
 | `-Quiet` | Instalación silenciosa (sin mensajes ni apertura). |
 | `-Branch "main"` | Instala desde otra rama del repositorio. |
+
+## Actualizaciones desde la app
+
+Al lado del engranaje de ajustes hay un botón con una **flecha circular**:
+
+- Al abrir WINWIZ se fija silenciosamente si hay una versión nueva en GitHub.
+  Si la hay, **el ícono empieza a girar** y cambia al color de acento.
+- Clic en el ícono abre una confirmación con la versión instalada y la
+  nueva; al aceptar, se descarga y aplica el instalador, WINWIZ se cierra y
+  **vuelve a abrir solo** al terminar. Se conservan lámparas, grupos y ajustes.
+- Si apretás el botón cuando no hay una actualización detectada, fuerza una
+  búsqueda manual y muestra el resultado en la barrita del panel.
+
+Necesita conexión a Internet. La primera vez que corre una instalación antigua
+toma el commit actual como base, así que el aviso aparece recién cuando haya un
+commit nuevo en el branch instalado.
 
 ## Desinstalar
 

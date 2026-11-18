@@ -6,6 +6,9 @@ import copy
 import ctypes
 import ipaddress
 import threading
+import math
+import re
+import subprocess
 from PyQt6.QtWidgets import (
     QApplication,
     QWidget,
@@ -65,8 +68,16 @@ from PyQt6.QtCore import (
     QEasingCurve,
     QRectF,
     QEvent,
+    QUrl,
+    pyqtProperty,
 )
-from PyQt6.QtNetwork import QAbstractSocket, QNetworkInterface
+from PyQt6.QtNetwork import (
+    QAbstractSocket,
+    QNetworkInterface,
+    QNetworkAccessManager,
+    QNetworkRequest,
+    QNetworkReply,
+)
 import time
 
 TEMP_MIN = 2200
@@ -100,6 +111,62 @@ def get_data_dir():
     path = os.path.join(base, "WizLampControl")
     os.makedirs(path, exist_ok=True)
     return path
+
+
+# ---------------------------------------------------------------------------
+# Actualizaciones: la version instalada se identifica por el SHA del commit
+# del branch desde el que se instalo (escrito por install.ps1).
+# ---------------------------------------------------------------------------
+
+UPDATE_REPO = "LautaroVegaRojo/WINWIZ"
+UPDATE_CHECK_URL = "https://api.github.com/repos/{repo}/commits/{branch}"
+UPDATE_INSTALLER_URL = (
+    "https://raw.githubusercontent.com/{repo}/{branch}/install.ps1"
+)
+UPDATE_STATE_FILE = os.path.join(get_data_dir(), "update_state.json")
+
+
+def _install_info():
+    """Lee `install-info.txt` de la carpeta de la app (si viene del instalador)."""
+    folder = os.path.dirname(os.path.abspath(__file__))
+    values = {}
+    try:
+        with open(os.path.join(folder, "install-info.txt"), "r", encoding="utf-8") as f:
+            for line in f:
+                if "=" in line:
+                    key, value = line.split("=", 1)
+                    values[key.strip()] = value.strip()
+    except OSError:
+        pass
+    return values
+
+
+def get_update_branch():
+    """Branch usado para chequear y descargar el instalador."""
+    branch = _install_info().get("branch", "main")
+    return re.sub(r"[^A-Za-z0-9._/-]", "", branch) or "main"
+
+
+def get_local_commit():
+    """Commit instalado: primero install-info.txt, luego el estado local."""
+    commit = _install_info().get("commit", "")
+    if commit:
+        return commit
+    try:
+        with open(UPDATE_STATE_FILE, "r", encoding="utf-8") as f:
+            data = json.load(f)
+        return data.get("commit", "") if isinstance(data, dict) else ""
+    except (OSError, ValueError):
+        return ""
+
+
+def set_update_baseline(commit):
+    """Guarda el primer commit visto como base (instalaciones sin `commit=`)."""
+    try:
+        with open(UPDATE_STATE_FILE, "w", encoding="utf-8") as f:
+            json.dump({"commit": commit}, f, indent=4)
+    except OSError:
+        pass
 
 
 # ---------------------------------------------------------------------------
@@ -1990,6 +2057,114 @@ class FolderIcon(QWidget):
         )
 
 
+class UpdateIconButton(HoverButton):
+    """Botón de actualización: círculo perfecto con una flecha, giratorio."""
+
+    def __init__(self, parent=None):
+        super().__init__("", parent, radius=6)
+        self.setFixedSize(28, 28)
+        self.setObjectName("updateButton")
+        self.setToolTip("Buscar actualizaciones")
+        self._angle = 0.0
+        self._state = "idle"
+        self._animation = QPropertyAnimation(self, b"angle")
+        self._animation.setDuration(1400)
+        self._animation.setStartValue(0.0)
+        self._animation.setEndValue(360.0)
+        self._animation.setLoopCount(-1)
+
+    def get_angle(self):
+        return self._angle
+
+    def set_angle(self, value):
+        self._angle = float(value)
+        self.update()
+
+    angle = pyqtProperty(float, get_angle, set_angle)
+
+    def is_busy(self):
+        return self._state == "busy"
+
+    def set_state(self, state):
+        self._state = state
+        tooltips = {
+            "idle": "Buscar actualizaciones",
+            "available": "Hay una versión nueva. Clic para actualizar WINWIZ.",
+            "busy": "Instalando la actualización…",
+        }
+        self.setToolTip(tooltips.get(state, tooltips["idle"]))
+        if state in ("available", "busy"):
+            if self._animation.state() != QPropertyAnimation.State.Running:
+                self._animation.start()
+        else:
+            self._animation.stop()
+            self._angle = 0.0
+        self.update()
+
+    def paintEvent(self, event):
+        painter = QPainter(self)
+        painter.setRenderHint(QPainter.RenderHint.Antialiasing)
+        if self._progress > 0.001:
+            hover = QColor(self._hover_color)
+            hover.setAlpha(round(hover.alpha() * self._progress))
+            painter.setPen(Qt.PenStyle.NoPen)
+            painter.setBrush(hover)
+            painter.drawRoundedRect(QRectF(self.rect()), self._radius, self._radius)
+
+        color = (
+            current_accent(self)
+            if self._state in ("available", "busy")
+            else QColor("#FFFFFF" if self._progress > 0.001 else "#D0D0D0")
+        )
+        pen = QPen(color, 1.8, Qt.PenStyle.SolidLine, Qt.PenCapStyle.RoundCap)
+
+        painter.save()
+        painter.translate(self.width() / 2.0, self.height() / 2.0)
+        painter.rotate(self._angle)
+
+        # Arco con un hueco arriba bien visible: así se distingue dónde
+        # empieza y dónde termina la flecha. Se dibuja con drawArc (sin
+        # QPainterPath) para evitar líneas rectas sobrantes, y está centrado
+        # en el widget para que el giro no se desplace.
+        radius = 6.5
+        # Qt mide ángulos desde las 3 en sentido antihorario y con el eje Y
+        # hacia abajo, al revés que math.cos/sin. Para que el arco vaya desde
+        # 310° hasta 230° (en ángulos math) hay que usar:
+        #   start_Qt = -310 = 50, span_Qt = -280.
+        start_math = 310
+        end_math = 230
+        start_qt = (-start_math) % 360  # 50
+        # El arco debe cubrir 280° en sentido antihorario-Qt (math creciente):
+        # de 310° a 230° pasando por 0/90/180. Eso es start_math + 280.
+        span_math = (end_math - start_math) % 360  # 280
+        span_qt = -span_math  # -280
+        painter.setPen(pen)
+        painter.setBrush(Qt.BrushStyle.NoBrush)
+        painter.drawArc(
+            QRectF(-radius, -radius, radius * 2, radius * 2),
+            int(start_qt * 16),
+            int(span_qt * 16),
+        )
+
+        # Punta triangular completamente adelante del extremo del arco, para
+        # que quede claro que está en la punta y no en medio de la línea.
+        end = math.radians(end_math)
+        cx, cy = math.cos(end), math.sin(end)
+        tx, ty = -cy, cx  # tangente en sentido horario
+        px, py = cx * radius, cy * radius
+        tip = QPointF(px + tx * 4.0, py + ty * 4.0)
+        base_x, base_y = px + tx * 1.2, py + ty * 1.2
+        painter.setPen(Qt.PenStyle.NoPen)
+        painter.setBrush(color)
+        head = QPainterPath()
+        head.moveTo(tip)
+        head.lineTo(QPointF(base_x + cx * 1.8, base_y + cy * 1.8))
+        head.lineTo(QPointF(base_x - cx * 1.8, base_y - cy * 1.8))
+        head.closeSubpath()
+        painter.drawPath(head)
+        painter.restore()
+
+
 class LampControl(QWidget):
     delete_requested = pyqtSignal(str)  # emite el mac de la lámpara a borrar
 
@@ -3545,6 +3720,17 @@ class PopupWindow(QWidget):
         self._glass_mode = "none"
         self._backdrop = None
         self._backdrop_offset = QPoint(0, 0)
+
+        # Actualizaciones: chequeo silencioso al abrir la app por primera vez.
+        self._update_net = QNetworkAccessManager(self)
+        self._update_net.finished.connect(self._on_update_checked)
+        self._update_reply = None
+        self._update_branch = get_update_branch()
+        self._local_commit = get_local_commit()
+        self._remote_commit = None
+        self._update_available = False
+        self._manual_check = False
+
         self.settings = load_settings()
         ModernToggle.apply_appearance(self.settings)
         self._tint_color = QColor(self.settings["glass"]["tint"])
@@ -3602,6 +3788,7 @@ class PopupWindow(QWidget):
 
         self.setup_ui()
         self.load_content()
+        QTimer.singleShot(1500, self.check_for_updates)
 
     def start_hide_animation(self):
         self.animation.stop()
@@ -3688,6 +3875,150 @@ class PopupWindow(QWidget):
             x = popup.center().x() - dialog.width() // 2
         y = min(max(area.top() + 8, popup.top()), area.bottom() - dialog.height() - 8)
         dialog.move(x, y)
+
+    # -- Actualizaciones ----------------------------------------------------
+
+    def check_for_updates(self):
+        """Consulta el último commit del branch instalado sin bloquear la UI."""
+        if self._update_reply is not None:
+            return
+        url = UPDATE_CHECK_URL.format(repo=UPDATE_REPO, branch=self._update_branch)
+        request = QNetworkRequest(QUrl(url))
+        request.setRawHeader(b"User-Agent", b"WINWIZ-UpdateCheck")
+        request.setRawHeader(b"Accept", b"application/vnd.github+json")
+        self._update_reply = self._update_net.get(request)
+
+    def _on_update_checked(self, reply):
+        if reply != self._update_reply:
+            reply.deleteLater()
+            return
+        self._update_reply = None
+        try:
+            if reply.error() != QNetworkReply.NetworkError.NoError:
+                _debug(f"No se pudo chequear actualizaciones: {reply.errorString()}")
+                if self._manual_check:
+                    self._show_update_message(
+                        "No se pudo comprobar la versión. Revisá tu conexión.",
+                        timeout=5000,
+                    )
+                return
+            data = json.loads(bytes(reply.readAll()).decode("utf-8"))
+            sha = data.get("sha") if isinstance(data, dict) else None
+            if not isinstance(sha, str) or len(sha) < 7:
+                return
+            self._remote_commit = sha
+            if not self._local_commit:
+                # Instalaciones anteriores no guardaban el commit: la primera
+                # respuesta marca la base para no avisar falsamente.
+                set_update_baseline(sha)
+                self._local_commit = sha
+                if self._manual_check:
+                    self._show_update_message(
+                        "Ya tenés la última versión.", timeout=4000
+                    )
+                return
+            if sha != self._local_commit:
+                self._update_available = True
+                self.update_button.set_state("available")
+                if self._manual_check:
+                    self._show_update_message(
+                        "Hay una versión nueva disponible.", timeout=5000
+                    )
+            elif self._manual_check:
+                self._show_update_message("Ya tenés la última versión.", timeout=4000)
+        except (ValueError, UnicodeDecodeError) as error:
+            _debug(f"Respuesta de actualización inválida: {error}")
+        finally:
+            if self._manual_check:
+                if not self._update_available:
+                    self.update_button.set_state("idle")
+                self._manual_check = False
+            reply.deleteLater()
+
+    def _show_update_message(self, text, timeout=None):
+        """Reutiliza la barra inline para mostrar el estado de la actualización."""
+        self.discovery_status.setText(text)
+        self.discovery_action.hide()
+        self.discovery_bar.show()
+        self.pause_auto_hide()
+        if timeout is not None:
+            self._discovery_status_timer.start(timeout)
+
+    def start_update(self):
+        """Chequea manualmente o aplica la actualización ya detectada."""
+        if self._discovery_running:
+            show_warning(
+                self, "Actualizar WINWIZ", "Terminá la búsqueda antes de actualizar."
+            )
+            return
+        if self._update_reply is not None:
+            return
+        if not self._update_available or not self._remote_commit:
+            self._manual_check = True
+            self.update_button.set_state("busy")
+            self._show_update_message("Buscando actualizaciones…")
+            self.check_for_updates()
+            return
+        message = (
+            "Se descargará e instalará la última versión desde GitHub. "
+            "WINWIZ se cerrará y volverá a abrir solo al terminar.\n\n"
+            f"Versión instalada: {self._local_commit[:7]}\n"
+            f"Versión nueva: {self._remote_commit[:7]}"
+        )
+        if not ask_confirmation(self, "Actualizar WINWIZ", message):
+            return
+        self._run_update()
+
+    def _run_update(self):
+        """Lanza el instalador y cierra la app para que pueda reemplazar los archivos."""
+        branch = self._update_branch
+        args = ["-Branch", branch]
+        startup = os.path.join(
+            os.environ.get("APPDATA", ""),
+            "Microsoft",
+            "Windows",
+            "Start Menu",
+            "Programs",
+            "Startup",
+            "WINWIZ.lnk",
+        )
+        if os.path.exists(startup):
+            args.append("-StartWithWindows")
+        installer = UPDATE_INSTALLER_URL.format(repo=UPDATE_REPO, branch=branch)
+        command = (
+            f"Wait-Process -Id {os.getpid()} -ErrorAction SilentlyContinue "
+            f"-Timeout 20; $ErrorActionPreference='Stop'; "
+            f"& ([scriptblock]::Create((irm '{installer}'))) {' '.join(args)}"
+        )
+        self.update_button.set_state("busy")
+        self._show_update_message("Descargando e instalando la actualización…")
+        self.wiz_manager.flush()
+        try:
+            flags = getattr(subprocess, "DETACHED_PROCESS", 0) | getattr(
+                subprocess, "CREATE_NEW_PROCESS_GROUP", 0
+            )
+            subprocess.Popen(
+                [
+                    "powershell.exe",
+                    "-NoProfile",
+                    "-ExecutionPolicy",
+                    "Bypass",
+                    "-Command",
+                    command,
+                ],
+                creationflags=flags,
+                close_fds=True,
+            )
+        except OSError as error:
+            _debug(f"No se pudo lanzar el instalador: {error}")
+            self.update_button.set_state("available")
+            show_warning(
+                self,
+                "Actualizar WINWIZ",
+                "No se pudo iniciar el instalador. Probá reinstalar manualmente.",
+            )
+            return
+        QTimer.singleShot(300, QApplication.instance().quit)
 
     def enable_frosted_glass(self):
         """Elige el método de blur según los ajustes y arranca actualizaciones."""
@@ -3913,6 +4244,11 @@ class PopupWindow(QWidget):
 
         btn_row.addWidget(self.discover_button)
         btn_row.addWidget(group_button)
+
+        self.update_button = UpdateIconButton(self)
+        self.update_button.setObjectName("updateButton")
+        self.update_button.clicked.connect(self.start_update)
+        btn_row.addWidget(self.update_button)
 
         self.settings_button = HoverButton("⚙", radius=6)
         self.settings_button.setObjectName("settingsButton")

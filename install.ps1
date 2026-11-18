@@ -35,6 +35,20 @@ $Repo = "LautaroVegaRojo/WINWIZ"
 $AppTitle = "WiZ Control"
 $DataDir = Join-Path $env:LOCALAPPDATA "WizLampControl"
 
+function Get-CommitSha([string]$BranchName) {
+    try {
+        $uri = "https://api.github.com/repos/$Repo/commits/$BranchName"
+        $response = Invoke-RestMethod -Uri $uri -TimeoutSec 10 -Headers @{
+            "User-Agent" = "WINWIZ-Installer"
+            "Accept" = "application/vnd.github+json"
+        }
+        if ($response -and $response.sha) { return [string]$response.sha }
+    } catch {
+        Write-Step "No se pudo leer el ultimo commit; la app no podra avisar actualizaciones."
+    }
+    return ""
+}
+
 # Permite configurar el instalador tambien desde el comando de una linea.
 if (-not $PSBoundParameters.ContainsKey("Branch") -and $env:WINWIZ_BRANCH) {
     $Branch = $env:WINWIZ_BRANCH
@@ -359,8 +373,10 @@ cd /d "%~dp0"
         New-ItemProperty -Path $uninstallKey -Name NoRepair -PropertyType DWord -Value 1 -Force | Out-Null
     }
 
+    $commitSha = if ($DryRun) { "" } else { Get-CommitSha -BranchName $Branch }
     @(
         "branch=$Branch",
+        "commit=$commitSha",
         "installed=$(Get-Date -Format o)",
         "install_dir=$InstallDir"
     ) | Set-Content -LiteralPath (Join-Path $InstallDir "install-info.txt") -Encoding UTF8
