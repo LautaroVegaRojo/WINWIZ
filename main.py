@@ -2089,7 +2089,7 @@ class SliderIcon(QWidget):
     """Iconos dibujados para los sliders de brillo, temperatura y color.
 
     Reemplazan a los glifos unicode: un sol, un termómetro frío/caliente y
-    una gota rellena con el color actual.
+    un punto relleno con el color actual.
     """
 
     def __init__(self, kind, parent=None, size=16):
@@ -2170,20 +2170,12 @@ class SliderIcon(QWidget):
         painter.drawEllipse(QPointF(cx, h * 0.78), w * 0.16, w * 0.16)
 
     def _paint_color(self, painter, cx, cy, w, h):
-        # Gota rellena con el color actual: más simple que una rueda y
-        # reconocible como "color" en los iconos de iOS/Android.
-        drop = QPainterPath()
-        top = h * 0.14
-        drop.moveTo(cx, top)
-        drop.quadTo(cx + w * 0.30, h * 0.50, cx + w * 0.24, h * 0.66)
-        drop.quadTo(cx + w * 0.18, h * 0.90, cx, h * 0.90)
-        drop.quadTo(cx - w * 0.18, h * 0.90, cx - w * 0.24, h * 0.66)
-        drop.quadTo(cx - w * 0.30, h * 0.50, cx, top)
-        drop.closeSubpath()
-
+        # Punto de color simple: reconocible al instante como "color" en
+        # iOS/Android, sin formas decorativas que distraigan.
+        radius = w * 0.30
         painter.setPen(QPen(QColor("#E0E0E0"), 0.9))
         painter.setBrush(self._color)
-        painter.drawPath(drop)
+        painter.drawEllipse(QPointF(cx, cy), radius, radius)
 
 
 class UpdateIconButton(HoverButton):
