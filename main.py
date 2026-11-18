@@ -202,7 +202,7 @@ DEFAULT_SETTINGS = {
         # Color del ícono en reposo. Con versión nueva se usa el acento.
         "color": "#d0d0d0",
         # Tamaño del dibujo en px (el botón sigue midiendo 28x28 como el engranaje).
-        "size": 14,
+        "size": 11,
     },
     "temperature": {
         # Degradado frío/caliente en la barra del slider de temperatura.

@@ -78,9 +78,9 @@ Al lado del engranaje de ajustes hay un botón con una **flecha circular**:
 - Si apretás el botón cuando no hay una actualización detectada, fuerza una
   búsqueda manual y muestra el resultado en la barrita del panel.
 - En **Ajustes de apariencia → Actualizaciones** podés elegir el color y el
-  tamaño del ícono en reposo (10-20 px, por defecto 14 px, igual que el
-  engranaje). Cuando hay una versión nueva, el ícono gira y usa el color de
-  acento para que se distinga.
+  tamaño del ícono en reposo (10-20 px, por defecto 11 px). El botón mantiene
+  el área de 28x28 del engranaje; cambia solo el dibujo. Cuando hay una
+  versión nueva, el ícono gira y usa el color de acento para que se distinga.
 
 Necesita conexión a Internet. La primera vez que corre una instalación antigua
 toma el commit actual como base, así que el aviso aparece recién cuando haya un
