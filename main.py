@@ -194,6 +194,10 @@ DEFAULT_SETTINGS = {
         "off": "#5c5c5c",  # botón apagado
         "knob": "#ffffff",  # perilla
     },
+    "update": {
+        # Color del ícono en reposo. Con versión nueva se usa el acento.
+        "color": "#d0d0d0",
+    },
 }
 
 # Rango compartido por sliders y switches. El grosor llega hasta 28 px para
@@ -303,6 +307,12 @@ def load_settings():
     # El botón de encendido comparte el color de acento de los sliders: una
     # sola opción controla las dos cosas.
     settings["toggle"]["on"] = settings["sliders"]["accent"]
+
+    update = stored.get("update")
+    if isinstance(update, dict):
+        settings["update"]["color"] = _valid_color_setting(
+            update.get("color"), DEFAULT_SETTINGS["update"]["color"]
+        )
     return settings
 
 
@@ -2067,6 +2077,7 @@ class UpdateIconButton(HoverButton):
         self.setToolTip("Buscar actualizaciones")
         self._angle = 0.0
         self._state = "idle"
+        self._idle_color = QColor(DEFAULT_SETTINGS["update"]["color"])
         self._animation = QPropertyAnimation(self, b"angle")
         self._animation.setDuration(1400)
         self._animation.setStartValue(0.0)
@@ -2084,6 +2095,11 @@ class UpdateIconButton(HoverButton):
 
     def is_busy(self):
         return self._state == "busy"
+
+    def set_color(self, color):
+        """Color del ícono cuando no hay una actualización disponible."""
+        self._idle_color = QColor(color)
+        self.update()
 
     def set_state(self, state):
         self._state = state
@@ -2114,7 +2130,7 @@ class UpdateIconButton(HoverButton):
         color = (
             current_accent(self)
             if self._state in ("available", "busy")
-            else QColor("#FFFFFF" if self._progress > 0.001 else "#D0D0D0")
+            else QColor("#FFFFFF" if self._progress > 0.001 else self._idle_color)
         )
         pen = QPen(color, 1.8, Qt.PenStyle.SolidLine, Qt.PenCapStyle.RoundCap)
 
@@ -3231,6 +3247,7 @@ class SettingsDialog(AppDialog):
         self._original = copy.deepcopy(settings)
         self._tint_color = QColor(settings["glass"]["tint"])
         self._accent_color = QColor(settings["sliders"]["accent"])
+        self._update_icon_color = QColor(settings["update"]["color"])
 
         # Aplicar la vista previa en cada píxel del arrastre re-estiliza el
         # popup y hasta recaptura la pantalla. Con 70 ms de retraso se siente
@@ -3439,6 +3456,36 @@ class SettingsDialog(AppDialog):
 
         root.addWidget(controls_group)
 
+        # --- Actualizaciones ----------------------------------------------
+        update_group = QGroupBox("Actualizaciones")
+        update_grid = QGridLayout(update_group)
+        update_grid.setContentsMargins(12, 18, 12, 12)
+        update_grid.setHorizontalSpacing(10)
+        update_grid.setVerticalSpacing(8)
+        update_grid.setColumnStretch(1, 1)
+
+        self.update_swatch = QPushButton()
+        self.update_swatch.setObjectName("colorSwatch")
+        self.update_swatch.setFixedSize(64, 22)
+        self.update_swatch.setCursor(Qt.CursorShape.PointingHandCursor)
+        self.update_swatch.setToolTip("Elegir color del ícono de actualización")
+        self.update_hex = QLabel()
+        self.update_hex.setObjectName("settingValue")
+        self._update_swatch(self.update_swatch, self._update_icon_color)
+        update_grid.addWidget(QLabel("Color del ícono:"), 0, 0)
+        update_grid.addWidget(
+            self._color_control(self.update_swatch, self.update_hex), 0, 1, 1, 2
+        )
+
+        update_hint = QLabel(
+            "El color se usa cuando no hay una versión nueva. Si hay una "
+            "actualización disponible, el ícono gira y pasa al color de acento."
+        )
+        update_hint.setObjectName("hintLabel")
+        update_hint.setWordWrap(True)
+        update_grid.addWidget(update_hint, 1, 0, 1, 3)
+        root.addWidget(update_group)
+
         # --- Botones ------------------------------------------------------
         buttons = QHBoxLayout()
         buttons.setSpacing(8)
@@ -3499,6 +3546,7 @@ class SettingsDialog(AppDialog):
         self.handle_slider.valueChanged.connect(self._refresh_state)
         self.tint_swatch.clicked.connect(self._pick_tint)
         self.accent_swatch.clicked.connect(self._pick_accent)
+        self.update_swatch.clicked.connect(self._pick_update_color)
         self.reset_button.clicked.connect(self._reset)
         self.cancel_button.clicked.connect(self.reject)
         self.save_button.clicked.connect(self.accept)
@@ -3520,6 +3568,7 @@ class SettingsDialog(AppDialog):
 
         self.tint_hex.setText(self._tint_color.name().upper())
         self.accent_hex.setText(self._accent_color.name().upper())
+        self.update_hex.setText(self._update_icon_color.name().upper())
         for key, label in self.toggle_hex_labels.items():
             label.setText(self._toggle_colors[key].name().upper())
         # Un solo juego de valores para todos los controles: acento, apagado,
@@ -3595,6 +3644,15 @@ class SettingsDialog(AppDialog):
             self._apply_dialog_style()
             self._refresh_state()
 
+    def _pick_update_color(self):
+        color = pick_color(
+            self, self._update_icon_color, "Color del ícono de actualización"
+        )
+        if color.isValid():
+            self._update_icon_color = color
+            self._update_swatch(self.update_swatch, color)
+            self._refresh_state()
+
     def _pick_toggle_color(self, key):
         titles = {
             "off": "Color de apagado (botón y riel del slider)",
@@ -3625,11 +3683,13 @@ class SettingsDialog(AppDialog):
 
         self._tint_color = QColor(defaults["glass"]["tint"])
         self._accent_color = QColor(defaults["sliders"]["accent"])
+        self._update_icon_color = QColor(defaults["update"]["color"])
         self._toggle_colors = {
             key: QColor(defaults["toggle"][key]) for key in ("off", "knob")
         }
         self._update_swatch(self.tint_swatch, self._tint_color)
         self._update_swatch(self.accent_swatch, self._accent_color)
+        self._update_swatch(self.update_swatch, self._update_icon_color)
         for key, swatch in self.toggle_swatches.items():
             self._update_swatch(swatch, self._toggle_colors[key])
         self._apply_dialog_style()
@@ -3671,6 +3731,7 @@ class SettingsDialog(AppDialog):
                     # autoexplicativo, pero siempre igual al acento.
                     "on": self._accent_color.name(),
                 },
+                "update": {"color": self._update_icon_color.name()},
             }
         )
 
@@ -3840,6 +3901,9 @@ class PopupWindow(QWidget):
             self.enable_frosted_glass()
         else:
             self.update()
+        # El ícono de actualización usa su propio color en reposo.
+        if previous["update"]["color"] != self.settings["update"]["color"]:
+            self.update_button.set_color(self.settings["update"]["color"])
         # El menú de la bandeja también sigue el acento elegido.
         if previous["sliders"].get("accent") != self.settings["sliders"].get(
             "accent"
@@ -4247,6 +4311,7 @@ class PopupWindow(QWidget):
 
         self.update_button = UpdateIconButton(self)
         self.update_button.setObjectName("updateButton")
+        self.update_button.set_color(self.settings["update"]["color"])
         self.update_button.clicked.connect(self.start_update)
         btn_row.addWidget(self.update_button)
 

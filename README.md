@@ -77,6 +77,9 @@ Al lado del engranaje de ajustes hay un botón con una **flecha circular**:
   **vuelve a abrir solo** al terminar. Se conservan lámparas, grupos y ajustes.
 - Si apretás el botón cuando no hay una actualización detectada, fuerza una
   búsqueda manual y muestra el resultado en la barrita del panel.
+- En **Ajustes de apariencia → Actualizaciones** podés elegir el color del
+  ícono en reposo. Cuando hay una versión nueva, el ícono gira y usa el color
+  de acento para que se distinga.
 
 Necesita conexión a Internet. La primera vez que corre una instalación antigua
 toma el commit actual como base, así que el aviso aparece recién cuando haya un
