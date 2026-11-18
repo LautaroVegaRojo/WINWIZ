@@ -2132,14 +2132,19 @@ class SliderIcon(QWidget):
             self._paint_color(painter, cx, cy, w)
 
     def _paint_brightness(self, painter, cx, cy, w):
-        alpha = 0.55 + 0.45 * (self._value / 100.0)
-        ray_color = QColor("#FFD67A")
-        ray_color.setAlphaF(alpha)
+        # Sol de línea (sun.max): círculo hueco y ocho rayos cortos.
+        color = QColor("#D8D8D8")
+        color.setAlphaF(0.7 + 0.3 * (self._value / 100.0))
+        painter.setPen(
+            QPen(color, max(1.1, w * 0.085), Qt.PenStyle.SolidLine,
+                 Qt.PenCapStyle.RoundCap)
+        )
+        painter.setBrush(Qt.BrushStyle.NoBrush)
 
-        rays = QPen(ray_color, max(1.0, w * 0.085), Qt.PenStyle.SolidLine,
-                    Qt.PenCapStyle.RoundCap)
-        painter.setPen(rays)
-        inner, outer = w * 0.28, w * 0.45
+        radius = w * 0.17
+        painter.drawEllipse(QPointF(cx, cy), radius, radius)
+
+        inner, outer = w * 0.29, w * 0.45
         for index in range(8):
             angle = index * math.pi / 4.0
             dx, dy = math.cos(angle), math.sin(angle)
@@ -2148,56 +2153,43 @@ class SliderIcon(QWidget):
                 QPointF(cx + dx * outer, cy + dy * outer),
             )
 
-        center = QColor("#FFD67A")
-        center.setAlphaF(0.75 + 0.25 * (self._value / 100.0))
-        painter.setPen(Qt.PenStyle.NoPen)
-        painter.setBrush(center)
-        painter.drawEllipse(QPointF(cx, cy), w * 0.18, w * 0.18)
-
     def _paint_temperature(self, painter, cx, cy, w, h):
-        # Termómetro con gradiente azul (frío) -> naranja (cálido) y una
-        # marca que sigue el valor del slider.
-        tube = QRectF(cx - w * 0.16, h * 0.13, w * 0.32, h * 0.58)
-        gradient = QLinearGradient(0, tube.top(), 0, tube.bottom())
-        gradient.setColorAt(0.0, QColor("#FF8A4C"))
-        gradient.setColorAt(1.0, QColor("#4FA8FF"))
+        # Termómetro de línea: contorno neutro y columna que va del naranja
+        # (cálido) al azul (frío) según el valor del slider.
+        tube = QRectF(cx - w * 0.125, h * 0.13, w * 0.25, h * 0.57)
+        bulb_y = h * 0.80
+        bulb_r = w * 0.19
+        top = tube.top() + w * 0.10
 
-        painter.setPen(QPen(QColor("#D0D0D0"), 1.0))
+        t = self._value / 100.0
+        warm, cold = QColor("#FF8A4C"), QColor("#4FA8FF")
+        liquid = QColor(
+            round(warm.red() + (cold.red() - warm.red()) * t),
+            round(warm.green() + (cold.green() - warm.green()) * t),
+            round(warm.blue() + (cold.blue() - warm.blue()) * t),
+        )
+
+        painter.setPen(
+            QPen(liquid, max(1.5, w * 0.11), Qt.PenStyle.SolidLine,
+                 Qt.PenCapStyle.RoundCap)
+        )
+        painter.setBrush(liquid)
+        painter.drawLine(QPointF(cx, bulb_y), QPointF(cx, top))
+        painter.drawEllipse(QPointF(cx, bulb_y), bulb_r * 0.72, bulb_r * 0.72)
+
+        painter.setPen(QPen(QColor("#D8D8D8"), 1.1))
         painter.setBrush(Qt.BrushStyle.NoBrush)
-        painter.drawRoundedRect(tube, w * 0.16, w * 0.16)
-
-        inner = QRectF(
-            tube.left() + w * 0.07,
-            tube.top() + w * 0.07,
-            tube.width() - w * 0.14,
-            tube.height() - w * 0.14,
-        )
-        painter.setPen(Qt.PenStyle.NoPen)
-        painter.setBrush(QBrush(gradient))
-        painter.drawRoundedRect(inner, w * 0.09, w * 0.09)
-
-        bulb_gradient = QLinearGradient(cx - w * 0.18, 0, cx + w * 0.18, 0)
-        bulb_gradient.setColorAt(0.0, QColor("#4FA8FF"))
-        bulb_gradient.setColorAt(1.0, QColor("#FF8A4C"))
-        painter.setBrush(QBrush(bulb_gradient))
-        painter.drawEllipse(QPointF(cx, h * 0.80), w * 0.19, w * 0.19)
-
-        marker_y = inner.top() + inner.height() * (self._value / 100.0)
-        painter.setPen(QPen(QColor("#FFFFFF"), 1.6, Qt.PenStyle.SolidLine,
-                            Qt.PenCapStyle.RoundCap))
-        painter.drawLine(
-            QPointF(inner.left() - w * 0.04, marker_y),
-            QPointF(inner.right() + w * 0.04, marker_y),
-        )
+        painter.drawRoundedRect(tube, w * 0.125, w * 0.125)
+        painter.drawEllipse(QPointF(cx, bulb_y), bulb_r, bulb_r)
 
     def _paint_color(self, painter, cx, cy, w):
         segments = (
             "#FF4D4D", "#FFC24D", "#5BD65B",
             "#4DD2FF", "#5B7BFF", "#C45BFF",
         )
-        radius = w * 0.33
+        radius = w * 0.34
         pen = QPen(Qt.PenStyle.SolidLine)
-        pen.setWidthF(max(2.0, w * 0.19))
+        pen.setWidthF(max(1.5, w * 0.13))
         pen.setCapStyle(Qt.PenCapStyle.FlatCap)
         for index, color in enumerate(segments):
             pen.setColor(QColor(color))
@@ -2209,9 +2201,9 @@ class SliderIcon(QWidget):
                 58 * 16,
             )
 
-        painter.setPen(QPen(QColor("#FFFFFF"), 0.9))
+        painter.setPen(QPen(QColor("#FFFFFF"), 0.8))
         painter.setBrush(self._color)
-        painter.drawEllipse(QPointF(cx, cy), w * 0.14, w * 0.14)
+        painter.drawEllipse(QPointF(cx, cy), w * 0.12, w * 0.12)
 
 
 class UpdateIconButton(HoverButton):
