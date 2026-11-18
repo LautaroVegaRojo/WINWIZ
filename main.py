@@ -2088,8 +2088,8 @@ class FolderIcon(QWidget):
 class SliderIcon(QWidget):
     """Iconos dibujados para los sliders de brillo, temperatura y color.
 
-    Reemplazan a los glifos unicode: un sol, un termómetro con gradiente
-    frío/caliente y una rueda de colores con el tono actual en el centro.
+    Reemplazan a los glifos unicode: un sol, un termómetro frío/caliente y
+    una gota rellena con el color actual.
     """
 
     def __init__(self, kind, parent=None, size=16):
@@ -2129,22 +2129,22 @@ class SliderIcon(QWidget):
         elif self.kind == "temperature":
             self._paint_temperature(painter, cx, cy, w, h)
         else:
-            self._paint_color(painter, cx, cy, w)
+            self._paint_color(painter, cx, cy, w, h)
 
     def _paint_brightness(self, painter, cx, cy, w):
         # Sol de línea (sun.max): círculo hueco y ocho rayos cortos.
         color = QColor("#D8D8D8")
         color.setAlphaF(0.7 + 0.3 * (self._value / 100.0))
         painter.setPen(
-            QPen(color, max(1.1, w * 0.085), Qt.PenStyle.SolidLine,
+            QPen(color, max(1.0, w * 0.07), Qt.PenStyle.SolidLine,
                  Qt.PenCapStyle.RoundCap)
         )
         painter.setBrush(Qt.BrushStyle.NoBrush)
 
-        radius = w * 0.17
+        radius = w * 0.13
         painter.drawEllipse(QPointF(cx, cy), radius, radius)
 
-        inner, outer = w * 0.29, w * 0.45
+        inner, outer = w * 0.22, w * 0.34
         for index in range(8):
             angle = index * math.pi / 4.0
             dx, dy = math.cos(angle), math.sin(angle)
@@ -2154,13 +2154,7 @@ class SliderIcon(QWidget):
             )
 
     def _paint_temperature(self, painter, cx, cy, w, h):
-        # Termómetro de línea: contorno neutro y columna que va del naranja
-        # (cálido) al azul (frío) según el valor del slider.
-        tube = QRectF(cx - w * 0.125, h * 0.13, w * 0.25, h * 0.57)
-        bulb_y = h * 0.80
-        bulb_r = w * 0.19
-        top = tube.top() + w * 0.10
-
+        # Termómetro mínimo: una sola forma rellena, sin contorno interior.
         t = self._value / 100.0
         warm, cold = QColor("#FF8A4C"), QColor("#4FA8FF")
         liquid = QColor(
@@ -2169,41 +2163,27 @@ class SliderIcon(QWidget):
             round(warm.blue() + (cold.blue() - warm.blue()) * t),
         )
 
-        painter.setPen(
-            QPen(liquid, max(1.5, w * 0.11), Qt.PenStyle.SolidLine,
-                 Qt.PenCapStyle.RoundCap)
-        )
+        tube = QRectF(cx - w * 0.095, h * 0.20, w * 0.19, h * 0.44)
+        painter.setPen(Qt.PenStyle.NoPen)
         painter.setBrush(liquid)
-        painter.drawLine(QPointF(cx, bulb_y), QPointF(cx, top))
-        painter.drawEllipse(QPointF(cx, bulb_y), bulb_r * 0.72, bulb_r * 0.72)
+        painter.drawRoundedRect(tube, w * 0.095, w * 0.095)
+        painter.drawEllipse(QPointF(cx, h * 0.78), w * 0.16, w * 0.16)
 
-        painter.setPen(QPen(QColor("#D8D8D8"), 1.1))
-        painter.setBrush(Qt.BrushStyle.NoBrush)
-        painter.drawRoundedRect(tube, w * 0.125, w * 0.125)
-        painter.drawEllipse(QPointF(cx, bulb_y), bulb_r, bulb_r)
+    def _paint_color(self, painter, cx, cy, w, h):
+        # Gota rellena con el color actual: más simple que una rueda y
+        # reconocible como "color" en los iconos de iOS/Android.
+        drop = QPainterPath()
+        top = h * 0.14
+        drop.moveTo(cx, top)
+        drop.quadTo(cx + w * 0.30, h * 0.50, cx + w * 0.24, h * 0.66)
+        drop.quadTo(cx + w * 0.18, h * 0.90, cx, h * 0.90)
+        drop.quadTo(cx - w * 0.18, h * 0.90, cx - w * 0.24, h * 0.66)
+        drop.quadTo(cx - w * 0.30, h * 0.50, cx, top)
+        drop.closeSubpath()
 
-    def _paint_color(self, painter, cx, cy, w):
-        segments = (
-            "#FF4D4D", "#FFC24D", "#5BD65B",
-            "#4DD2FF", "#5B7BFF", "#C45BFF",
-        )
-        radius = w * 0.34
-        pen = QPen(Qt.PenStyle.SolidLine)
-        pen.setWidthF(max(1.5, w * 0.13))
-        pen.setCapStyle(Qt.PenCapStyle.FlatCap)
-        for index, color in enumerate(segments):
-            pen.setColor(QColor(color))
-            painter.setPen(pen)
-            painter.setBrush(Qt.BrushStyle.NoBrush)
-            painter.drawArc(
-                QRectF(cx - radius, cy - radius, radius * 2, radius * 2),
-                int(index * 60 - 1) * 16,
-                58 * 16,
-            )
-
-        painter.setPen(QPen(QColor("#FFFFFF"), 0.8))
+        painter.setPen(QPen(QColor("#E0E0E0"), 0.9))
         painter.setBrush(self._color)
-        painter.drawEllipse(QPointF(cx, cy), w * 0.12, w * 0.12)
+        painter.drawPath(drop)
 
 
 class UpdateIconButton(HoverButton):
