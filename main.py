@@ -2085,6 +2085,135 @@ class FolderIcon(QWidget):
         )
 
 
+class SliderIcon(QWidget):
+    """Iconos dibujados para los sliders de brillo, temperatura y color.
+
+    Reemplazan a los glifos unicode: un sol, un termómetro con gradiente
+    frío/caliente y una rueda de colores con el tono actual en el centro.
+    """
+
+    def __init__(self, kind, parent=None, size=16):
+        super().__init__(parent)
+        self.kind = kind
+        self.setFixedSize(size, size)
+        self._value = 100 if kind == "brightness" else 50
+        self._color = QColor("#ffffff")
+        tooltips = {
+            "brightness": "Brillo",
+            "temperature": "Temperatura: fría (azul) ↔ cálida (naranja)",
+            "color": "Color",
+        }
+        self.setToolTip(tooltips.get(kind, ""))
+
+    def set_value(self, value):
+        value = min(100, max(0, int(value)))
+        if value == self._value:
+            return
+        self._value = value
+        self.update()
+
+    def set_color(self, color):
+        color = QColor(color)
+        if color.name() == self._color.name():
+            return
+        self._color = color
+        self.update()
+
+    def paintEvent(self, event):
+        painter = QPainter(self)
+        painter.setRenderHint(QPainter.RenderHint.Antialiasing)
+        w, h = self.width(), self.height()
+        cx, cy = w / 2.0, h / 2.0
+        if self.kind == "brightness":
+            self._paint_brightness(painter, cx, cy, w)
+        elif self.kind == "temperature":
+            self._paint_temperature(painter, cx, cy, w, h)
+        else:
+            self._paint_color(painter, cx, cy, w)
+
+    def _paint_brightness(self, painter, cx, cy, w):
+        alpha = 0.55 + 0.45 * (self._value / 100.0)
+        ray_color = QColor("#FFD67A")
+        ray_color.setAlphaF(alpha)
+
+        rays = QPen(ray_color, max(1.0, w * 0.085), Qt.PenStyle.SolidLine,
+                    Qt.PenCapStyle.RoundCap)
+        painter.setPen(rays)
+        inner, outer = w * 0.28, w * 0.45
+        for index in range(8):
+            angle = index * math.pi / 4.0
+            dx, dy = math.cos(angle), math.sin(angle)
+            painter.drawLine(
+                QPointF(cx + dx * inner, cy + dy * inner),
+                QPointF(cx + dx * outer, cy + dy * outer),
+            )
+
+        center = QColor("#FFD67A")
+        center.setAlphaF(0.75 + 0.25 * (self._value / 100.0))
+        painter.setPen(Qt.PenStyle.NoPen)
+        painter.setBrush(center)
+        painter.drawEllipse(QPointF(cx, cy), w * 0.18, w * 0.18)
+
+    def _paint_temperature(self, painter, cx, cy, w, h):
+        # Termómetro con gradiente azul (frío) -> naranja (cálido) y una
+        # marca que sigue el valor del slider.
+        tube = QRectF(cx - w * 0.16, h * 0.13, w * 0.32, h * 0.58)
+        gradient = QLinearGradient(0, tube.top(), 0, tube.bottom())
+        gradient.setColorAt(0.0, QColor("#FF8A4C"))
+        gradient.setColorAt(1.0, QColor("#4FA8FF"))
+
+        painter.setPen(QPen(QColor("#D0D0D0"), 1.0))
+        painter.setBrush(Qt.BrushStyle.NoBrush)
+        painter.drawRoundedRect(tube, w * 0.16, w * 0.16)
+
+        inner = QRectF(
+            tube.left() + w * 0.07,
+            tube.top() + w * 0.07,
+            tube.width() - w * 0.14,
+            tube.height() - w * 0.14,
+        )
+        painter.setPen(Qt.PenStyle.NoPen)
+        painter.setBrush(QBrush(gradient))
+        painter.drawRoundedRect(inner, w * 0.09, w * 0.09)
+
+        bulb_gradient = QLinearGradient(cx - w * 0.18, 0, cx + w * 0.18, 0)
+        bulb_gradient.setColorAt(0.0, QColor("#4FA8FF"))
+        bulb_gradient.setColorAt(1.0, QColor("#FF8A4C"))
+        painter.setBrush(QBrush(bulb_gradient))
+        painter.drawEllipse(QPointF(cx, h * 0.80), w * 0.19, w * 0.19)
+
+        marker_y = inner.top() + inner.height() * (self._value / 100.0)
+        painter.setPen(QPen(QColor("#FFFFFF"), 1.6, Qt.PenStyle.SolidLine,
+                            Qt.PenCapStyle.RoundCap))
+        painter.drawLine(
+            QPointF(inner.left() - w * 0.04, marker_y),
+            QPointF(inner.right() + w * 0.04, marker_y),
+        )
+
+    def _paint_color(self, painter, cx, cy, w):
+        segments = (
+            "#FF4D4D", "#FFC24D", "#5BD65B",
+            "#4DD2FF", "#5B7BFF", "#C45BFF",
+        )
+        radius = w * 0.33
+        pen = QPen(Qt.PenStyle.SolidLine)
+        pen.setWidthF(max(2.0, w * 0.19))
+        pen.setCapStyle(Qt.PenCapStyle.FlatCap)
+        for index, color in enumerate(segments):
+            pen.setColor(QColor(color))
+            painter.setPen(pen)
+            painter.setBrush(Qt.BrushStyle.NoBrush)
+            painter.drawArc(
+                QRectF(cx - radius, cy - radius, radius * 2, radius * 2),
+                int(index * 60 - 1) * 16,
+                58 * 16,
+            )
+
+        painter.setPen(QPen(QColor("#FFFFFF"), 0.9))
+        painter.setBrush(self._color)
+        painter.drawEllipse(QPointF(cx, cy), w * 0.14, w * 0.14)
+
+
 class UpdateIconButton(HoverButton):
     """Botón de actualización: círculo perfecto con una flecha, giratorio."""
 
@@ -2368,10 +2497,8 @@ class LampControl(QWidget):
         brightness_layout = QHBoxLayout()
         brightness_layout.setSpacing(8)
 
-        bright_label = QLabel("☀")
-        bright_label.setFixedWidth(16)
-        bright_label.setStyleSheet("font-size: 12px; color: #E0E0E0;")
-        brightness_layout.addWidget(bright_label)
+        self.brightness_icon = SliderIcon("brightness", self)
+        brightness_layout.addWidget(self.brightness_icon)
 
         self.brightness_slider = ImprovedSlider(Qt.Orientation.Horizontal)
         self.brightness_slider.setRange(10, 100)
@@ -2391,10 +2518,8 @@ class LampControl(QWidget):
         temp_layout = QHBoxLayout()
         temp_layout.setSpacing(8)
 
-        temp_label = QLabel("◐")
-        temp_label.setFixedWidth(16)
-        temp_label.setStyleSheet("font-size: 12px; color: #E0E0E0;")
-        temp_layout.addWidget(temp_label)
+        self.temp_icon = SliderIcon("temperature", self)
+        temp_layout.addWidget(self.temp_icon)
 
         self.temp_slider = ImprovedSlider(Qt.Orientation.Horizontal)
         self.temp_slider.setRange(0, 100)
@@ -2414,10 +2539,9 @@ class LampControl(QWidget):
         color_layout = QHBoxLayout()
         color_layout.setSpacing(8)
 
-        color_label = QLabel("●")
-        color_label.setFixedWidth(16)
-        color_label.setStyleSheet("font-size: 12px; color: #E0E0E0;")
-        color_layout.addWidget(color_label)
+        self.color_icon = SliderIcon("color", self)
+        self.color_icon.set_color(self.current_color)
+        color_layout.addWidget(self.color_icon)
 
         self.color_slider = ImprovedSlider(Qt.Orientation.Horizontal)
         self.color_slider.setRange(0, 359)
@@ -2444,6 +2568,7 @@ class LampControl(QWidget):
 
     def update_color_preview(self):
         color = self.current_color
+        self.color_icon.set_color(color)
         self.color_preview.setStyleSheet(
             f"""
             QLabel {{
@@ -2463,16 +2588,19 @@ class LampControl(QWidget):
     def update_brightness_label(self, value):
         """Actualiza solo el label sin enviar comando"""
         self.brightness_value.setText(f"{value}%")
+        self.brightness_icon.set_value(value)
 
     def update_temp_label(self, slider_val):
         """Actualiza solo el label sin enviar comando"""
         kelvin = self.slider_to_kelvin(slider_val)
         self.temp_value.setText(f"{kelvin}K")
+        self.temp_icon.set_value(slider_val)
 
     def update_color_preview_only(self, hue):
         """Actualiza solo el preview sin enviar comando"""
         self.current_hue = hue
         color = QColor.fromHsv(hue, 255, 255)
+        self.color_icon.set_color(color)
         self.color_preview.setStyleSheet(
             f"""
             QLabel {{
@@ -2701,10 +2829,8 @@ class GroupControl(QWidget):
         brightness_layout = QHBoxLayout()
         brightness_layout.setSpacing(8)
 
-        bright_label = QLabel("☀")
-        bright_label.setFixedWidth(16)
-        bright_label.setStyleSheet("font-size: 12px; color: #E0E0E0;")
-        brightness_layout.addWidget(bright_label)
+        self.brightness_icon = SliderIcon("brightness", self)
+        brightness_layout.addWidget(self.brightness_icon)
 
         self.brightness_slider = ImprovedSlider(Qt.Orientation.Horizontal)
         self.brightness_slider.setRange(10, 100)
@@ -2724,10 +2850,8 @@ class GroupControl(QWidget):
         temp_layout = QHBoxLayout()
         temp_layout.setSpacing(8)
 
-        temp_label = QLabel("◐")
-        temp_label.setFixedWidth(16)
-        temp_label.setStyleSheet("font-size: 12px; color: #E0E0E0;")
-        temp_layout.addWidget(temp_label)
+        self.temp_icon = SliderIcon("temperature", self)
+        temp_layout.addWidget(self.temp_icon)
 
         self.temp_slider = ImprovedSlider(Qt.Orientation.Horizontal)
         self.temp_slider.setRange(0, 100)
@@ -2747,10 +2871,9 @@ class GroupControl(QWidget):
         color_layout = QHBoxLayout()
         color_layout.setSpacing(8)
 
-        color_label = QLabel("●")
-        color_label.setFixedWidth(16)
-        color_label.setStyleSheet("font-size: 12px; color: #E0E0E0;")
-        color_layout.addWidget(color_label)
+        self.color_icon = SliderIcon("color", self)
+        self.color_icon.set_color(self.current_color)
+        color_layout.addWidget(self.color_icon)
 
         self.color_slider = ImprovedSlider(Qt.Orientation.Horizontal)
         self.color_slider.setRange(0, 359)
@@ -2796,15 +2919,18 @@ class GroupControl(QWidget):
     def update_brightness_label(self, value):
         """Actualiza solo el label sin enviar comando"""
         self.brightness_value.setText(f"{value}%")
+        self.brightness_icon.set_value(value)
 
     def update_temp_label(self, slider_val):
         """Actualiza solo el label sin enviar comando"""
         kelvin = self.slider_to_kelvin(slider_val)
         self.temp_value.setText(f"{kelvin}K")
+        self.temp_icon.set_value(slider_val)
 
     def update_color_preview_only(self, hue):
         """Actualiza solo el preview sin enviar comando"""
         color = QColor.fromHsv(hue, 255, 255)
+        self.color_icon.set_color(color)
         self.color_preview.setStyleSheet(
             f"""
             QLabel {{
@@ -2817,6 +2943,7 @@ class GroupControl(QWidget):
 
     def update_color_preview(self):
         color = self.current_color
+        self.color_icon.set_color(color)
         self.color_preview.setStyleSheet(
             f"""
             QLabel {{
