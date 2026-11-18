@@ -82,6 +82,45 @@ Por defecto se conservan las lámparas y los ajustes. Para borrarlos también:
 & ([scriptblock]::Create((irm https://raw.githubusercontent.com/LautaroVegaRojo/WINWIZ/main/uninstall.ps1))) -RemoveData
 ```
 
+## Volver a poner el icono en el inicio (Startup)
+
+Si por cualquier motivo desapareció el acceso de inicio (`WINWIZ.lnk` en la
+carpeta Startup), la forma más simple es reinstalar con `-StartWithWindows`:
+
+```powershell
+& ([scriptblock]::Create((irm https://raw.githubusercontent.com/LautaroVegaRojo/WINWIZ/main/install.ps1))) -StartWithWindows
+```
+
+El instalador siempre escribe el mismo archivo, así que **no crea duplicados**
+aunque el acceso ya exista. Eso sí: cerrá WINWIZ desde el icono de la bandeja
+antes de reinstalar (si está abierto, el instalador no continúa).
+
+Si preferís no reinstalar, abrí **PowerShell** y pegá esto para crear el acceso
+directamente:
+
+```powershell
+$installDir = Join-Path $env:LOCALAPPDATA "Programs\WINWIZ"
+$pythonw = Join-Path $installDir ".venv\Scripts\pythonw.exe"
+if (-not (Test-Path -LiteralPath $pythonw)) { $pythonw = Join-Path $installDir ".venv\Scripts\python.exe" }
+$mainPy = Join-Path $installDir "main.py"
+$icon = Join-Path $installDir "icon.ico"
+$lnk = Join-Path ([Environment]::GetFolderPath("Startup")) "WINWIZ.lnk"
+
+$shortcut = (New-Object -ComObject WScript.Shell).CreateShortcut($lnk)
+$shortcut.TargetPath = $pythonw
+$shortcut.Arguments = '"' + $mainPy + '"'
+$shortcut.WorkingDirectory = $installDir
+$shortcut.IconLocation = $icon
+$shortcut.Description = "WiZ Control - luces WiZ"
+$shortcut.Save()
+```
+
+En los dos casos queda un único acceso en
+`%APPDATA%\Microsoft\Windows\Start Menu\Programs\Startup` apuntando a la
+instalación actual. Para confirmar, cerrá sesión y volvé a entrar o revisá
+**Administrador de tareas → Inicio**. El desinstalador elimina este acceso, así
+que después de desinstalar hay que volver a agregarlo.
+
 ## Ejecutar desde el código
 
 ```powershell
