@@ -201,8 +201,14 @@ DEFAULT_SETTINGS = {
     "update": {
         # Color del ícono en reposo. Con versión nueva se usa el acento.
         "color": "#d0d0d0",
+        # Tamaño del dibujo en px (el botón sigue midiendo 28x28 como el engranaje).
+        "size": 14,
     },
 }
+
+UPDATE_ICON_SIZE_MIN = 10
+UPDATE_ICON_SIZE_MAX = 20
+
 
 # Rango compartido por sliders y switches. El grosor llega hasta 28 px para
 # que la barra del slider pueda igualar o superar el grosor de la barra del
@@ -316,6 +322,14 @@ def load_settings():
     if isinstance(update, dict):
         settings["update"]["color"] = _valid_color_setting(
             update.get("color"), DEFAULT_SETTINGS["update"]["color"]
+        )
+        settings["update"]["size"] = int(
+            _clamp_setting(
+                update.get("size"),
+                UPDATE_ICON_SIZE_MIN,
+                UPDATE_ICON_SIZE_MAX,
+                DEFAULT_SETTINGS["update"]["size"],
+            )
         )
     return settings
 
@@ -2082,6 +2096,7 @@ class UpdateIconButton(HoverButton):
         self._angle = 0.0
         self._state = "idle"
         self._idle_color = QColor(DEFAULT_SETTINGS["update"]["color"])
+        self._icon_size = DEFAULT_SETTINGS["update"]["size"]
         self._animation = QPropertyAnimation(self, b"angle")
         self._animation.setDuration(1400)
         self._animation.setStartValue(0.0)
@@ -2103,6 +2118,14 @@ class UpdateIconButton(HoverButton):
     def set_color(self, color):
         """Color del ícono cuando no hay una actualización disponible."""
         self._idle_color = QColor(color)
+        self.update()
+
+    def set_size(self, size):
+        """Tamaño del dibujo; el botón mantiene el área del engranaje."""
+        size = min(UPDATE_ICON_SIZE_MAX, max(UPDATE_ICON_SIZE_MIN, int(size)))
+        if size == self._icon_size:
+            return
+        self._icon_size = size
         self.update()
 
     def set_state(self, state):
@@ -2136,7 +2159,15 @@ class UpdateIconButton(HoverButton):
             if self._state in ("available", "busy")
             else QColor("#FFFFFF" if self._progress > 0.001 else self._idle_color)
         )
-        pen = QPen(color, 1.8, Qt.PenStyle.SolidLine, Qt.PenCapStyle.RoundCap)
+        # El dibujo original mide 16 px; el resto de medidas escalan juntas
+        # para que la flecha no se deforme al cambiar el tamaño.
+        scale = self._icon_size / 16.0
+        pen = QPen(
+            color,
+            max(1.2, 1.8 * scale),
+            Qt.PenStyle.SolidLine,
+            Qt.PenCapStyle.RoundCap,
+        )
 
         painter.save()
         painter.translate(self.width() / 2.0, self.height() / 2.0)
@@ -2146,7 +2177,7 @@ class UpdateIconButton(HoverButton):
         # empieza y dónde termina la flecha. Se dibuja con drawArc (sin
         # QPainterPath) para evitar líneas rectas sobrantes, y está centrado
         # en el widget para que el giro no se desplace.
-        radius = 6.5
+        radius = 6.5 * scale
         # Qt mide ángulos desde las 3 en sentido antihorario y con el eje Y
         # hacia abajo, al revés que math.cos/sin. Para que el arco vaya desde
         # 310° hasta 230° (en ángulos math) hay que usar:
@@ -2172,14 +2203,15 @@ class UpdateIconButton(HoverButton):
         cx, cy = math.cos(end), math.sin(end)
         tx, ty = -cy, cx  # tangente en sentido horario
         px, py = cx * radius, cy * radius
-        tip = QPointF(px + tx * 4.0, py + ty * 4.0)
-        base_x, base_y = px + tx * 1.2, py + ty * 1.2
+        tip = QPointF(px + tx * 4.0 * scale, py + ty * 4.0 * scale)
+        base_x, base_y = px + tx * 1.2 * scale, py + ty * 1.2 * scale
+        head_half = 1.8 * scale
         painter.setPen(Qt.PenStyle.NoPen)
         painter.setBrush(color)
         head = QPainterPath()
         head.moveTo(tip)
-        head.lineTo(QPointF(base_x + cx * 1.8, base_y + cy * 1.8))
-        head.lineTo(QPointF(base_x - cx * 1.8, base_y - cy * 1.8))
+        head.lineTo(QPointF(base_x + cx * head_half, base_y + cy * head_half))
+        head.lineTo(QPointF(base_x - cx * head_half, base_y - cy * head_half))
         head.closeSubpath()
         painter.drawPath(head)
         painter.restore()
@@ -3481,13 +3513,26 @@ class SettingsDialog(AppDialog):
             self._color_control(self.update_swatch, self.update_hex), 0, 1, 1, 2
         )
 
+        (
+            self.update_size_slider,
+            self.update_size_value,
+            update_size_control,
+        ) = self._make_slider_row(
+            UPDATE_ICON_SIZE_MIN,
+            UPDATE_ICON_SIZE_MAX,
+            settings["update"]["size"],
+            step=2,
+        )
+        update_grid.addWidget(QLabel("Tamaño del ícono:"), 1, 0)
+        update_grid.addWidget(update_size_control, 1, 1, 1, 2)
+
         update_hint = QLabel(
-            "El color se usa cuando no hay una versión nueva. Si hay una "
-            "actualización disponible, el ícono gira y pasa al color de acento."
+            "El color y el tamaño se usan cuando no hay una versión nueva. "
+            "Si hay actualización, el ícono gira y pasa al color de acento."
         )
         update_hint.setObjectName("hintLabel")
         update_hint.setWordWrap(True)
-        update_grid.addWidget(update_hint, 1, 0, 1, 3)
+        update_grid.addWidget(update_hint, 2, 0, 1, 3)
         root.addWidget(update_group)
 
         # --- Botones ------------------------------------------------------
@@ -3551,6 +3596,7 @@ class SettingsDialog(AppDialog):
         self.tint_swatch.clicked.connect(self._pick_tint)
         self.accent_swatch.clicked.connect(self._pick_accent)
         self.update_swatch.clicked.connect(self._pick_update_color)
+        self.update_size_slider.valueChanged.connect(self._refresh_state)
         self.reset_button.clicked.connect(self._reset)
         self.cancel_button.clicked.connect(self.reject)
         self.save_button.clicked.connect(self.accept)
@@ -3595,6 +3641,7 @@ class SettingsDialog(AppDialog):
         self.blur_value.setText(str(self.blur_slider.value()))
         self.thickness_value.setText(f"{self.thickness_slider.value()} px")
         self.handle_value.setText(f"{self.handle_slider.value()} px")
+        self.update_size_value.setText(f"{self.update_size_slider.value()} px")
 
         self._update_preview_slider_appearance()
         self._preview_timer.start()
@@ -3681,6 +3728,7 @@ class SettingsDialog(AppDialog):
             self.blur_slider,
             self.thickness_slider,
             self.handle_slider,
+            self.update_size_slider,
         )
         for widget in widgets:
             widget.blockSignals(True)
@@ -3705,6 +3753,7 @@ class SettingsDialog(AppDialog):
         self.blur_slider.setValue(defaults["glass"]["blur"])
         self.thickness_slider.setValue(defaults["sliders"]["thickness"])
         self.handle_slider.setValue(defaults["sliders"]["handle"])
+        self.update_size_slider.setValue(defaults["update"]["size"])
 
         for widget in widgets:
             widget.blockSignals(False)
@@ -3735,7 +3784,10 @@ class SettingsDialog(AppDialog):
                     # autoexplicativo, pero siempre igual al acento.
                     "on": self._accent_color.name(),
                 },
-                "update": {"color": self._update_icon_color.name()},
+                "update": {
+                    "color": self._update_icon_color.name(),
+                    "size": self.update_size_slider.value(),
+                },
             }
         )
 
@@ -3905,9 +3957,11 @@ class PopupWindow(QWidget):
             self.enable_frosted_glass()
         else:
             self.update()
-        # El ícono de actualización usa su propio color en reposo.
+        # El ícono de actualización usa su propio color y tamaño en reposo.
         if previous["update"]["color"] != self.settings["update"]["color"]:
             self.update_button.set_color(self.settings["update"]["color"])
+        if previous["update"]["size"] != self.settings["update"]["size"]:
+            self.update_button.set_size(self.settings["update"]["size"])
         # El menú de la bandeja también sigue el acento elegido.
         if previous["sliders"].get("accent") != self.settings["sliders"].get(
             "accent"
@@ -4316,6 +4370,7 @@ class PopupWindow(QWidget):
         self.update_button = UpdateIconButton(self)
         self.update_button.setObjectName("updateButton")
         self.update_button.set_color(self.settings["update"]["color"])
+        self.update_button.set_size(self.settings["update"]["size"])
         self.update_button.clicked.connect(self.start_update)
         btn_row.addWidget(self.update_button)
 
