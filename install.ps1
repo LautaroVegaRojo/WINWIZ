@@ -374,12 +374,18 @@ cd /d "%~dp0"
     }
 
     $commitSha = if ($DryRun) { "" } else { Get-CommitSha -BranchName $Branch }
-    @(
+    $installInfo = @(
         "branch=$Branch",
         "commit=$commitSha",
         "installed=$(Get-Date -Format o)",
         "install_dir=$InstallDir"
-    ) | Set-Content -LiteralPath (Join-Path $InstallDir "install-info.txt") -Encoding UTF8
+    ) -join "`n"
+    # UTF8 sin BOM: Python lee el archivo con utf-8 y un BOM romperia "branch".
+    [System.IO.File]::WriteAllText(
+        (Join-Path $InstallDir "install-info.txt"),
+        $installInfo + "`n",
+        (New-Object System.Text.UTF8Encoding($false))
+    )
 
     # -- Listo ---------------------------------------------------------------
     if (-not $Quiet) {

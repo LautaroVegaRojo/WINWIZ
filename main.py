@@ -131,7 +131,11 @@ def _install_info():
     folder = os.path.dirname(os.path.abspath(__file__))
     values = {}
     try:
-        with open(os.path.join(folder, "install-info.txt"), "r", encoding="utf-8") as f:
+        # utf-8-sig tolera el BOM que escribian versiones anteriores del
+        # instalador; si no, la clave "branch" se leia como "\\ufeffbranch".
+        with open(
+            os.path.join(folder, "install-info.txt"), "r", encoding="utf-8-sig"
+        ) as f:
             for line in f:
                 if "=" in line:
                     key, value = line.split("=", 1)
