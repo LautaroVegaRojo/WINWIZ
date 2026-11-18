@@ -86,6 +86,18 @@ Necesita conexión a Internet. La primera vez que corre una instalación antigua
 toma el commit actual como base, así que el aviso aparece recién cuando haya un
 commit nuevo en el branch instalado.
 
+## Barra de temperatura
+
+En **Ajustes de apariencia → Barra de temperatura** podés activar o desactivar
+(el valor por defecto es **activado**) el degradado del slider de temperatura:
+
+- La barra completa va de **cálido a la izquierda (2200 K, naranja)** a
+  **frío a la derecha (6500 K, azul)**, con un tono neutro en el medio.
+- Así se ve de antemano el color al que se va a llegar, sin tener que soltar
+  el tirador para comprobarlo.
+- Si lo desactivás, la barra vuelve al esquema de siempre: el color de acento
+  hasta el tirador y el color de apagado después.
+
 ## Desinstalar
 
 Desde PowerShell:

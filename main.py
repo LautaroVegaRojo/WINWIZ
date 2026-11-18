@@ -204,6 +204,10 @@ DEFAULT_SETTINGS = {
         # Tamaño del dibujo en px (el botón sigue midiendo 28x28 como el engranaje).
         "size": 14,
     },
+    "temperature": {
+        # Degradado frío/caliente en la barra del slider de temperatura.
+        "gradient": True,
+    },
 }
 
 UPDATE_ICON_SIZE_MIN = 10
@@ -330,6 +334,15 @@ def load_settings():
                 UPDATE_ICON_SIZE_MAX,
                 DEFAULT_SETTINGS["update"]["size"],
             )
+        )
+
+    temperature = stored.get("temperature")
+    if isinstance(temperature, dict):
+        gradient = temperature.get(
+            "gradient", DEFAULT_SETTINGS["temperature"]["gradient"]
+        )
+        settings["temperature"]["gradient"] = (
+            gradient if isinstance(gradient, bool) else True
         )
     return settings
 
@@ -1498,6 +1511,15 @@ class ImprovedSlider(QSlider):
         (1.0, "#ff0000"),
     )
 
+    # La barra de temperatura va de cálido (izquierda, 2200K) a frío
+    # (derecha, 6500K), igual que el ícono del termómetro. El blanco suave
+    # del medio hace la transición natural, como en los selectores de iOS.
+    TEMP_GRADIENT_STOPS = (
+        (0.0, "#FF8A4C"),
+        (0.5, "#F2EFEA"),
+        (1.0, "#4FA8FF"),
+    )
+
     def __init__(self, orientation, parent=None):
         super().__init__(orientation, parent)
         # El fondo se dibuja a mano sobre el vidrio del popup: sin esto Qt
@@ -1514,6 +1536,7 @@ class ImprovedSlider(QSlider):
         self._off_color = QColor(DEFAULT_SETTINGS["toggle"]["off"])
         self._handle_color = QColor(DEFAULT_SETTINGS["toggle"]["knob"])
         self._gradient = False
+        self._temperature_gradient = False
         self._bar_height = control_bar_height(self._thickness, self._handle)
         self.setMinimumHeight(self._bar_height + 4)
 
@@ -1528,15 +1551,16 @@ class ImprovedSlider(QSlider):
 
     # -- apariencia --------------------------------------------------------
 
-    def apply_appearance(self, settings, gradient=False):
+    def apply_appearance(self, settings, gradient=False, temperature=False):
         """Aplica los ajustes unificados de controles.
 
         El acento, el color de apagado y el de la perilla se comparten con el
         switch; el grosor y el tamaño del tirador también. Así un solo juego de
         controles modifica sliders y botones a la vez.
 
-        ``gradient=True`` se usa para el slider de matiz (degradé arcoíris y
-        sin relleno)."""
+        ``gradient=True`` se usa para el slider de matiz (degradé arcoíris).
+        ``temperature=True`` pinta la barra completa con el degradado
+        cálido/frío, para ver el color al que se va a llegar antes de soltar."""
         sliders = settings["sliders"]
         defaults = DEFAULT_SETTINGS["sliders"]
         toggle = settings.get("toggle", DEFAULT_SETTINGS["toggle"])
@@ -1563,6 +1587,7 @@ class ImprovedSlider(QSlider):
             _valid_color_setting(toggle.get("knob"), toggle_defaults["knob"])
         )
         self._gradient = bool(gradient)
+        self._temperature_gradient = bool(temperature)
         self._bar_height = control_bar_height(self._thickness, self._handle)
         self.setMinimumHeight(self._bar_height + 4)
         self.update()
@@ -1618,9 +1643,14 @@ class ImprovedSlider(QSlider):
         position = self._slider_position()
         center_x = self._handle_padding() + self._handle / 2 + position
 
-        if self._gradient:
+        if self._gradient or self._temperature_gradient:
+            # El matiz y la temperatura muestran toda la barra con su
+            # degradado: así se ve el color final antes de parar el tirador.
+            stops = (
+                self.COLOR_STOPS if self._gradient else self.TEMP_GRADIENT_STOPS
+            )
             gradient = QLinearGradient(groove.left(), 0, groove.right(), 0)
-            for stop, color in self.COLOR_STOPS:
+            for stop, color in stops:
                 gradient.setColorAt(stop, QColor(color))
             painter.setBrush(QBrush(gradient))
             painter.drawRoundedRect(groove, radius, radius)
@@ -2486,6 +2516,7 @@ class LampControl(QWidget):
         temp_layout.addWidget(self.temp_icon)
 
         self.temp_slider = ImprovedSlider(Qt.Orientation.Horizontal)
+        self.temp_slider.setObjectName("tempSlider")
         self.temp_slider.setRange(0, 100)
         self.temp_slider.set_value_silently(self.kelvin_to_slider(self.current_temp))
         self.temp_slider.valueChangedDelayed.connect(self.send_temp_command)
@@ -2818,6 +2849,7 @@ class GroupControl(QWidget):
         temp_layout.addWidget(self.temp_icon)
 
         self.temp_slider = ImprovedSlider(Qt.Orientation.Horizontal)
+        self.temp_slider.setObjectName("tempSlider")
         self.temp_slider.setRange(0, 100)
         self.temp_slider.set_value_silently(self.kelvin_to_slider(self.current_temp))
         self.temp_slider.valueChangedDelayed.connect(self.send_temp_command)
@@ -3583,6 +3615,43 @@ class SettingsDialog(AppDialog):
 
         root.addWidget(controls_group)
 
+        # --- Temperatura ---------------------------------------------------
+        temperature_group = QGroupBox("Barra de temperatura")
+        temperature_grid = QGridLayout(temperature_group)
+        temperature_grid.setContentsMargins(12, 18, 12, 12)
+        temperature_grid.setHorizontalSpacing(10)
+        temperature_grid.setVerticalSpacing(8)
+        temperature_grid.setColumnStretch(1, 1)
+
+        self.temp_gradient_check = QCheckBox(
+            "Mostrar degradado frío/caliente en la barra"
+        )
+        self.temp_gradient_check.setChecked(
+            settings["temperature"]["gradient"]
+        )
+        self.temp_gradient_check.setToolTip(
+            "La barra completa va de cálido (izquierda) a frío (derecha)"
+        )
+        temperature_grid.addWidget(self.temp_gradient_check, 0, 0, 1, 3)
+
+        self.temp_preview = ImprovedSlider(Qt.Orientation.Horizontal)
+        self.temp_preview.setObjectName("tempPreviewSlider")
+        self.temp_preview.setRange(0, 100)
+        self.temp_preview.setValue(25)
+        temperature_grid.addWidget(QLabel("Vista previa:"), 1, 0)
+        temperature_grid.addWidget(self.temp_preview, 1, 1, 1, 2)
+
+        temperature_hint = QLabel(
+            "Con el degradado activo, la izquierda es cálida (2200 K) y la "
+            "derecha fría (6500 K), igual que el color que recibe la lámpara. "
+            "Si lo desactivás, la barra vuelve al color de acento de siempre."
+        )
+        temperature_hint.setObjectName("hintLabel")
+        temperature_hint.setWordWrap(True)
+        temperature_grid.addWidget(temperature_hint, 2, 0, 1, 3)
+
+        root.addWidget(temperature_group)
+
         # --- Actualizaciones ----------------------------------------------
         update_group = QGroupBox("Actualizaciones")
         update_grid = QGridLayout(update_group)
@@ -3688,6 +3757,7 @@ class SettingsDialog(AppDialog):
         self.accent_swatch.clicked.connect(self._pick_accent)
         self.update_swatch.clicked.connect(self._pick_update_color)
         self.update_size_slider.valueChanged.connect(self._refresh_state)
+        self.temp_gradient_check.toggled.connect(self._refresh_state)
         self.reset_button.clicked.connect(self._reset)
         self.cancel_button.clicked.connect(self.reject)
         self.save_button.clicked.connect(self.accept)
@@ -3735,6 +3805,10 @@ class SettingsDialog(AppDialog):
         self.update_size_value.setText(f"{self.update_size_slider.value()} px")
 
         self._update_preview_slider_appearance()
+        self.temp_preview.apply_appearance(
+            self.get_settings(),
+            temperature=self.temp_gradient_check.isChecked(),
+        )
         self._preview_timer.start()
 
     def _emit_preview(self):
@@ -3820,6 +3894,7 @@ class SettingsDialog(AppDialog):
             self.thickness_slider,
             self.handle_slider,
             self.update_size_slider,
+            self.temp_gradient_check,
         )
         for widget in widgets:
             widget.blockSignals(True)
@@ -3845,6 +3920,7 @@ class SettingsDialog(AppDialog):
         self.thickness_slider.setValue(defaults["sliders"]["thickness"])
         self.handle_slider.setValue(defaults["sliders"]["handle"])
         self.update_size_slider.setValue(defaults["update"]["size"])
+        self.temp_gradient_check.setChecked(defaults["temperature"]["gradient"])
 
         for widget in widgets:
             widget.blockSignals(False)
@@ -3878,6 +3954,9 @@ class SettingsDialog(AppDialog):
                 "update": {
                     "color": self._update_icon_color.name(),
                     "size": self.update_size_slider.value(),
+                },
+                "temperature": {
+                    "gradient": self.temp_gradient_check.isChecked(),
                 },
             }
         )
@@ -4036,6 +4115,7 @@ class PopupWindow(QWidget):
         if (
             previous["sliders"] != self.settings["sliders"]
             or previous["toggle"] != self.settings["toggle"]
+            or previous["temperature"] != self.settings["temperature"]
         ):
             self.apply_slider_appearance()
         # El tinte y la opacidad se repintan en paintEvent: NO hace falta
@@ -4639,8 +4719,14 @@ class PopupWindow(QWidget):
         Así la vista previa de los ajustes solo actualiza los sliders en lugar
         de repasar todo el árbol de controles del popup."""
         for slider in self.findChildren(ImprovedSlider):
+            name = slider.objectName()
             slider.apply_appearance(
-                self.settings, gradient=slider.objectName() == "colorSlider"
+                self.settings,
+                gradient=name == "colorSlider",
+                temperature=(
+                    name == "tempSlider"
+                    and self.settings["temperature"]["gradient"]
+                ),
             )
 
     def load_content(self):
